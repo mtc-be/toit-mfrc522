@@ -1,1 +1,5 @@
-# Toit Lock File.
+prefixes:
+  mfrc522: ..
+packages:
+  ..:
+    path: ..

@@ -1,0 +1,50 @@
+PICC state diagram:
+
+When a PICC enters the field the "new" bit is set.
+This bit is cleared once the HLTA command is executed.
+
+Power-Off
+   |
+   |  (In Field)
+   v
+HALT/IDLE  (in spec the HALT with the "new" bit is called "IDLE").
+   |
+   | REQ (only when "new" bit is active), WUPA.     Any other command goes back to HALT/IDLE.
+   v
+READY
+   |
+   | SELECT.   The AC command stays in READY.  Any other command goes back to HALT/IDLE.
+   v
+ACTIVE
+   |
+   | RATS (
+   v
+
+Power-Off
+   |
+   |  (In Field)
+   v
+Idle / Halt  (Idle when coming from Power-Off, and not haven't been in Protocol/Halt, yet)
+  |                                      ^
+  | REQA (only when in Idle) , WUPA      | REQA, WUPA, nAC, nSELECT, HLTA, Error
+  v                                      |
+
+
+Power-off -> Idle -> Ready -> Active
+               ^----<--+----<--+ |  \
+                                 |   \
+              /------------------/    +-> Protocol -+
+             v                       /              |
+            Halt  -> Ready  ->  Active              |
+             ^         |           |                |
+              \-----<--+---<-------+---<------------+
+
+
+RequestA (REQA):
+-
+
+WakeUpA (WUPA):
+
+
+IsNewCardPresent:
+- send PICC-RequestA
