@@ -25,8 +25,12 @@ main:
 
   reader.on
 
-  5.repeat:
+  50.repeat:
     catch --trace:
       print "reading"
-      print reader.is_new_card_present
+      data/ByteArray? := reader.is_new_card_present
+      if data:
+        data = reader.select
+        print data
+
     sleep --ms=2_000
