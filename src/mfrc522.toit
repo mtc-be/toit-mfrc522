@@ -13,7 +13,7 @@ class RfidException:
   Error when a device did not respond.
 
   This can happen if the user requested to wake a specific device, or if
-    the anti-collision protocol selected one of two PICCs, but none responded at
+    the anti-collision protocol selected one of two cards, but none responded at
     the next step.
   */
   static NO_RESPONSE ::= 0
@@ -24,8 +24,8 @@ class RfidException:
   /**
   A protocol error was detected.
 
-  A PICC responded in an unexpected way. Most often, this is actually caused by
-    a communication error; for example, when too many PICCs are in the field.
+  A card responded in an unexpected way. Most often, this is actually caused by
+    a communication error; for example, when too many cards are in the field.
   */
   static PROTOCOL ::= 2
 
@@ -58,7 +58,7 @@ class RfidException:
   constructor.temperature: code = TEMPERATURE
 
   stringify -> string:
-    if code == NO_RESPONSE: return "No response from PICC"
+    if code == NO_RESPONSE: return "No response from card"
     if code == CHECKSUM: return "Checksum error"
     if code == PROTOCOL: return "Protocol error"
     if code == TIMEOUT_ERROR: return "Timeout"
@@ -71,6 +71,7 @@ class Mfrc522:
   static COMMAND_REGISTER_ ::= 0x01 << 1
   static COM_IRQ_REGISTER_ ::= 0x04 << 1
   static ERROR_REGISTER_ ::= 0x06 << 1
+  static STATUS_2_REGISTER_ ::= 0x08 << 1
   static FIFO_DATA_REGISTER_ ::= 0x09 << 1
   static FIFO_LEVEL_REGISTER_ ::= 0x0A << 1
   static BIT_FRAMING_REGISTER_ ::= 0x0D << 1
@@ -107,7 +108,7 @@ class Mfrc522:
     reset_soft_
     reset_communication_
 
-    // When communicating with a PICC we need a timeout if something goes wrong.
+    // When communicating with a card we need a timeout if something goes wrong.
     // f_timer = 13.56 MHz / (2 * pre_scaler + 1).
     // We pre_scale by a factor of 169, giving us a scaled frequency of ~40kHz, and a timer period of ~25us.
     pre_scaler := 0x0A9
@@ -142,8 +143,8 @@ class Mfrc522:
   A short frame consists of just 7 bits of data. It doesn't have any CRC or parity bit.
 
   Common short-frame commands:
-  - REQA (0x26): Request any new PICC to go into IDLE state.
-  - WUPA (0x52): Requests any PICC to go into IDLE state.
+  - REQA (0x26): Request any new card to go into IDLE state.
+  - WUPA (0x52): Requests any card to go into IDLE state.
 
   Other values:
   - 0x35: Optional timeslot method. (see Annex C of iso14443-3)
@@ -221,11 +222,9 @@ class Mfrc522:
     // Bit 3: reserved for future use.
     // Bit 2-0: TxLastBits. Used for transmission of bit oriented frames: defines the number of
     //     bits of the last byte that will be transmitted. 0 indicates that all bits should be transmitted.
-    // The PICC_CMD_REQA should be sent in a "short frame" which has only 7 bits.
-    // Iso-14443-3, 6.4.1. "The REQA and WUPA commands [..] are transmitted within a short frame".
     registers_.write_u8 BIT_FRAMING_REGISTER_ ((rx_align << 4) | tx_last_bits)
 
-  transceive_ bytes/ByteArray --allow_collision/bool=false --check_crc/bool=false -> ByteArray?:
+  transceive_ bytes/ByteArray --command/int=COMMAND_TRANSCEIVE_ --allow_collision/bool=false --check_crc/bool=false -> ByteArray?:
     // The FIFO can handle up to 64 bytes.
     if bytes.size > 64: throw "INVALID_ARGUMENT"
     // Cancel any existing command.
@@ -243,16 +242,18 @@ class Mfrc522:
     registers_.write_bytes FIFO_DATA_REGISTER_ bytes
 
     // Send the command.
-    registers_.write_u8 COMMAND_REGISTER_ COMMAND_TRANSCEIVE_
+    registers_.write_u8 COMMAND_REGISTER_ command
 
-    // Execute the transceive.
-    // 9.3.1.14:
-    //   Bit 7: StartSend: If 1, starts the transmission of data; only valid in
-    //       combination with the Transceive command.
-    registers_.write_u8 BIT_FRAMING_REGISTER_ (registers_.read_u8 BIT_FRAMING_REGISTER_) | 0x80
+    if command == COMMAND_TRANSCEIVE_:
+      // Execute the transceive.
+      // 9.3.1.14:
+      //   Bit 7: StartSend: If 1, starts the transmission of data; only valid in
+      //       combination with the Transceive command.
+      registers_.write_u8 BIT_FRAMING_REGISTER_ (registers_.read_u8 BIT_FRAMING_REGISTER_) | 0x80
 
     // Wait for the response:
     completed := false
+    // TODO(florian): make sure timing is correct.
     for i := 0; i < 10; i++:
       irqs := registers_.read_u8 COM_IRQ_REGISTER_
       // Irq bits:
@@ -469,7 +470,7 @@ class Mfrc522:
 
   PICCs can be woken either by sending a REQA or WUPA. See $(do --new [block]) and $with_picc.
   */
-  select_ uid/ByteArray=#[] -> Picc?:
+  select_ uid/ByteArray=#[] -> Card:
     // Section 6.5.3.1
     // A UID is either 4, 7, or 10 bytes long.
     // A cascade level has only space for 4 bytes of payload.
@@ -542,19 +543,47 @@ class Mfrc522:
       else if cascade_level == 2: uid = uid_buffer[1..8].copy
       else: uid = uid_buffer[1..4] + uid_buffer[5..]
 
-      return Picc uid sak[0]
+      return Card this uid sak[0]
 
     unreachable
 
-  /**
-  Sends a HLTA (halt-a) command to the PICC.
-  */
-  halt_ -> none:
-    hlta := #[0x50, 0x00, 0x00, 0x00]
-    // The transceive will wait for a response, timing out.
-    // However, that's not a bad thing to do anyway, as we should give the PICC time to
-    // go into HALT state.
-    transceive_standard_ hlta
+  is_authenticated_ -> bool:
+    // Section 9.3.1.9.
+    // Bit 3: MFCrypto1On. Indicates that the MIFARE Crypto1 unit is switched on.
+    return (registers_.read_u8 STATUS_2_REGISTER_) & 0x08 != 0
+
+  // TODO(florian): add support for key B.
+  authenticate_ --block/int --key/ByteArray --uid/ByteArray:
+    if uid.size != 4 and uid.size != 7 and uid.size != 10: throw "INVALID_ARGUMENT"
+    if key.size != 6: throw "INVALID_ARGUMENT"
+
+    // See MIFARE Classic EV1 1K spec.
+    // https://www.nxp.com/docs/en/data-sheet/MF1S50YYX_V1.pdf
+    // Section 9.1.
+    AUTHENT_KEY_A_COMMAND ::= 0x60
+
+    // Section 10.3.1.9. MFAuthent of MFRC522 datasheet.
+    // 12 bytes need to be written into the FIFO:
+    // - Authentication command code (60h, 61h), selecting key A or B.
+    // - Block address
+    // - 6 sector key bytes.
+    // - 4 card serial number bytes.
+    bytes := ByteArray 12
+    bytes[0] = AUTHENT_KEY_A_COMMAND
+    bytes[1] = block
+    bytes.replace 2 key
+    // Fill in the last 4 bytes of the UID.
+    // See section 3.2.5 of AN10927.
+    // See section 10.1.3 of MIFARE Classic EV1 1K spec.
+    bytes.replace 8 uid[uid.size - 4  ..]
+
+    transceive_ --command=COMMAND_MF_AUTHENT_ bytes
+
+  stop_crypto_:
+    // Section 9.3.1.9.
+    // Bit 3: MFCrypto1On. When this bit is cleared then the crypto1 is turned off.
+    old := registers_.read_u8 STATUS_2_REGISTER_
+    registers_.write_u8 STATUS_2_REGISTER_ (old & ~0x08)
 
   /**
   Wakes up all new PICCs and executes the given $block for each.
@@ -566,34 +595,38 @@ class Mfrc522:
 
     while true:
       reset_communication_
-      // Wake up new PICCs.
-      // ISO 14443-3
-      PICC_CMD_REQA ::= 0x26
+      // Wake up new cards.
+      // The CMD_REQA should be sent in a "short frame" which has only 7 bits.
+      // Iso-14443-3, 6.4.1. "The REQA and WUPA commands [..] are transmitted within a short frame".
+      CMD_REQA ::= 0x26
       // We don't really care for the response.
-      if (transceive_short_ PICC_CMD_REQA --allow_collision) == null: return
-      uid := select_
+      if (transceive_short_ CMD_REQA --allow_collision) == null: return
+      card := select_
       try:
-        block.call uid
+        block.call card
       finally:
-        halt_
+        card.close
 
   /**
-  Wakes up all PICCs and selects the PICC with the given $uid. Then executes the given $block.
+  Wakes up all cards and selects the card with the given $uid. Then executes the given $block.
 
-  The $block is called with the UID of the PICC as argument.
+  The $block is called with the $Card as argument.
   */
   with_picc uid/ByteArray [block] -> none:
     reset_communication_
     // Wake up the given PICC.
     // ISO 14443-3
-    PICC_CMD_WUPA ::= 0x52
-    // We don't really care for the response.
-    if (transceive_short_ PICC_CMD_WUPA --allow_collision) == null: return
-    select_ uid
+    CMD_WUPA ::= 0x52
+    // The CMD_WUPA should be sent in a "short frame" which has only 7 bits.
+    // Iso-14443-3, 6.4.1. "The REQA and WUPA commands [..] are transmitted within a short frame".
+    if (transceive_short_ CMD_WUPA --allow_collision) == null:
+      // We don't really care for the content of the response.
+      return
+    card := select_ uid
     try:
-      block.call uid
+      block.call card
     finally:
-      halt_
+      card.close
 
   antenna_on:
     current := registers_.read_u8 TX_CONTROL_REGISTER_
@@ -632,6 +665,11 @@ class Mfrc522:
     registers_.write_u8 RX_MODE_REGISTER_ 0x00
     // Reset ModWidthReg.
     registers_.write_u8 MOD_WIDTH_REGISTER_ 0x26
+
+    // Section 9.3.1.9.
+    // Bit 3: MFCrypto1On. When this bit is cleared then the crypto1 is turned off.
+    old := registers_.read_u8 STATUS_2_REGISTER_
+    registers_.write_u8 STATUS_2_REGISTER_ (old & ~0x08)
 
   /**
   Performs a self test.
@@ -766,9 +804,13 @@ class SelfTestData:
 
   constructor .version .bytes:
 
+/**
+An RFID card.
 
-class Picc:
-  /** Unknown type of PICC. */
+Also known as "PICC" ("Proximity Inductive Coupling Card").
+*/
+class Card:
+  /** Unknown type of card. */
   static TYPE_UNKNOWN	::= 0
 
   /** MIFARE Ultralight or Ultralight C. */
@@ -782,30 +824,51 @@ class Picc:
   /** MIFARE Plus (2KB or 4KB) or MIFARE DESFire */
   static TYPE_MIFARE_PLUS_DESFIRE ::= 5
 
-  /** The UID of this PICC. */
+  /** The UID of this card. */
   uid/ByteArray
+  // The proximity coupling device (aka "transceiver").
+  transceiver_/Mfrc522
   sak_/int
+  is_closed/bool := false
 
-  constructor uid/ByteArray sak/int:
-    if sak & 0x80 != 0: return Mifare uid sak
-    return Picc.private_ uid sak
+  constructor transceiver/Mfrc522 uid/ByteArray sak/int:
+    if sak & 0x08 != 0: return MifareCard transceiver uid sak
+    return Card.private_ transceiver uid sak
 
-  constructor.private_ .uid .sak_:
+  constructor.private_ .transceiver_ .uid .sak_:
 
-  /** Whether this PICC is ISO-14443-4 compliant. */
+  /** Whether this card is ISO-14443-4 compliant. */
   is_iso_14443_4_compliant -> bool:
     return sak_ & 0b00100100 == 0b00100000
 
-  /** Whether this PICC is ISO-18092 (NFC) compliant. */
+  /** Whether this card is ISO-18092 (NFC) compliant. */
   is_iso_18092_compliant -> bool:
     return sak_ & 0b01000100 == 0b01000100
 
   /**
-  The type of this PICC.
+  The type of this card.
 
-  Note that MIFARE Plus PICCs might report themselves as generic PICCs for privace reasons.
+  Note that MIFARE Plus cards might report themselves as generic cards for privace reasons.
   */
   type -> int: return sak_to_type_ sak_ uid
+
+  /**
+  Transmits the given $bytes as standard frame to the card.
+
+  Returns the response from the card.
+  */
+  transceive bytes/ByteArray --check_crc/bool=false -> ByteArray?:
+    return transceiver_.transceive_standard_ bytes --check_crc=check_crc
+
+  /**
+  Sends a HLTA ('halt' of type A) command to the card.
+  */
+  close -> none:
+    hlta := #[0x50, 0x00, 0x00, 0x00]
+    // The transceive will wait for a response, timing out.
+    // However, that's not a bad thing to do anyway, as we should give the PICC time to
+    // go into HALT state.
+    transceiver_.transceive_standard_ hlta
 
   static sak_to_type_ sak/int uid/ByteArray -> int:
     // See NXP AN 10833 - MIFARE Type ID Procedure.
@@ -820,7 +883,7 @@ class Picc:
     return TYPE_UNKNOWN
 
   static type_to_str_ t/int -> string:
-    if t == TYPE_UNKNOWN: return "Unknown PICC"
+    if t == TYPE_UNKNOWN: return "Unknown card"
     if t == TYPE_MIFARE_MINI: return "MIFARE Mini, 320 bytes"
     if t == TYPE_MIFARE_1K: return "MIFARE 1KB"
     if t == TYPE_MIFARE_4K: return "MIFARE 4KB"
@@ -828,21 +891,43 @@ class Picc:
     if t == TYPE_MIFARE_UL: return "MIFARE Ultralight or Ultralight C"
     unreachable
 
-  // This functions shows if a PICC is compliant with ISO/IEC 14443-4.
   stringify -> string:
     uid_str := ""
     uid.do: uid_str += "$(%02x it)"
     return "UID: $uid_str - $(type_to_str_ type)"
 
-class Mifare extends Picc:
-  constructor uid/ByteArray sak/int:
-    super.private_ uid sak
+class MifareCard extends Card:
+  /** Default key for Mifare cards. */
+  static DEFAULT_KEY := #[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+
+  constructor transceiver/Mfrc522 uid/ByteArray sak/int:
+    super.private_ transceiver uid sak
+
+  authenticate --block/int key/ByteArray=DEFAULT_KEY:
+    return transceiver_.authenticate_ --uid=uid --block=block --key=key
+
+  is_authenticated -> bool:
+    return transceiver_.is_authenticated_
+
+  read --block/int:
+    // TODO(florian): check validity of block.
+    MIFARE_READ ::= 0x30
+    bytes := #[ MIFARE_READ, block, 0x00, 0x00]
+    result := transceive bytes --check_crc
+    // TODO(florian): cut off CRC?
+    return result
+
+
+  close -> none:
+    // Call halt first, before we reset the authentication.
+    super
+    transceiver_.stop_crypto_
 
   dump:
     no_of_sectors := ?
-    if type == Picc.TYPE_MIFARE_MINI: no_of_sectors = 1
-    else if type == Picc.TYPE_MIFARE_1K: no_of_sectors = 16
-    else if type == Picc.TYPE_MIFARE_4K: no_of_sectors = 40
+    if type == Card.TYPE_MIFARE_MINI: no_of_sectors = 1
+    else if type == Card.TYPE_MIFARE_1K: no_of_sectors = 16
+    else if type == Card.TYPE_MIFARE_4K: no_of_sectors = 40
     else: unreachable
 
     // no_of_sectors.repeat:

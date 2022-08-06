@@ -37,6 +37,12 @@ main:
 
       found_piccs.do:
         reader.with_picc it.uid:
+          if it is mfrc522.MifareCard:
+            mifare := it as mfrc522.MifareCard
+            mifare.authenticate --block=0
+            print "Authenticated: $mifare.is_authenticated"
+            print (mifare.read --block=0)
+
           print "activated picc $it again"
 
     reader.antenna_off
