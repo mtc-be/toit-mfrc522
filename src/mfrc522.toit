@@ -173,7 +173,26 @@ class Mfrc522:
     bytes[bytes.size - 2] = crc & 0xFF
     bytes[bytes.size - 1] = (crc >> 8) & 0xFF
 
+    // Send all 8 bits of the last (only) byte.
+    set_framing_ --tx_last_bits=0
     return transceive_ bytes --check_crc=check_crc
+
+  /**
+  Transmits an anticollision frame and returns the response.
+
+  An anticollision frame might have only some bits of the last byte that are valid. During
+    sending only those last bits are used. During receiving the first bits are shifted as to
+    complete the byte.
+  */
+  transceive_anticollision bytes/ByteArray --last_byte_bits/int -> ByteArray?:
+    // We want to send only 'tx_last_bits' bits. The remaining bits should be ignored.
+    tx_last_bits := last_byte_bits
+    // When receiving, the first bit sholud be shifted by 'rx_align' which is the same as the
+    // bits w
+    rx_align := last_byte_bits
+
+    set_framing_ --rx_align=rx_align --tx_last_bits=tx_last_bits
+    return transceive_ bytes --allow_collision
 
   /**
   Sets the framing for future transmissions.
@@ -331,7 +350,7 @@ class Mfrc522:
   Returns null if no response was received. (A bit of a hack...).
   // TODO(florian): should we switch to an exception?
   */
-  cascade_ command/int uid_buffer/ByteArray --uid_is_known/bool -> bool?:
+  cascade_ command/int uid_buffer/ByteArray --uid_is_known/bool -> bool:
       assert: uid_buffer.size == 4
 
       known_bits := uid_is_known ? 8 * 4 : 0
@@ -379,14 +398,8 @@ class Mfrc522:
           bytes[index++] = bcc
 
           assert: index == 7
-          crc := compute_crc_ bytes[..index]
-          bytes[index++] = crc & 0xFF
-          bytes[index++] = (crc >> 8) & 0xFF
+          response := transceive_standard bytes[..index + 2] --check_crc
 
-          // Send all bits.
-          registers_.write_u8 BIT_FRAMING_REGISTER_ 0x00
-
-          response := transceive_ --check_crc bytes
           if not response: throw RfidException.no_response
           // The SAK must be exactly 3 bytes long.
           if response.size != 3: throw RfidException.protocol
@@ -396,16 +409,8 @@ class Mfrc522:
         // We have an incomplete UID.
         // Request the PICCs to complete the ID and watch for collisions.
 
-        // We want to send only 'tx_last_bits' bits. The remaining bits should be ignored.
-        tx_last_bits := valid_bits
-        // When receiving, the first bit sholud be shifted by 'rx_align'.
-        rx_align := valid_bits
-        registers_.write_u8 BIT_FRAMING_REGISTER_ ((rx_align << 4) | tx_last_bits)
-
-        response := transceive_ --allow_collision bytes[0..index]
-        if not response:
-          if known_bits != 0: throw RfidException.no_response
-          return null
+        response := transceive_anticollision bytes[..index] --last_byte_bits=valid_bits
+        if not response: throw RfidException.no_response
 
         error := registers_.read_u8 ERROR_REGISTER_
         detected_collision := error & 0x08 != 0
@@ -441,10 +446,9 @@ class Mfrc522:
           if not has_valid_collision_position:
             // Collision detected, but without any valid position.
             // Give up.
-            return null
+            throw RfidException.internal
 
           collision_position := collision_value & 0x1F
-          print "collision position: $collision_position"
           // If the collision position is 0, then the collision happened at bit 32.
           // See MFRC522 - 9.3.1.15, table 50.
           if collision_position == 0: collision_position = 32
@@ -517,10 +521,10 @@ class Mfrc522:
       if not needs_another_cascade:
         // Temporarily put the PICC into halt.
         hlta := #[0x50, 0x00, 0x00, 0x00]
-        crc := compute_crc_ hlta[..2]
-        hlta[2] = crc & 0xFF
-        hlta[3] = crc >> 8
-        transceive_ hlta
+        // The transceive will wait for a response, timing out.
+        // However, that's not a bad thing to do anyway, as we should give the PICC time to
+        // go into HALT state.
+        transceive_standard hlta
 
         // Remove the cascade tags.
         if cascade_level == 1: return uid_buffer[0..4].copy
