@@ -360,7 +360,7 @@ class Mfrc522:
         index := 0
         // The biggest outbound frame consists of 6 bytes:
         // - 1 byte command.
-        // - 1 byte valid bits.
+        // - 1 byte valid bytes/bits.
         // - 4 bytes of UID (potentially the first one being a Cascade Tag, indicating that the UID needs
         //          an additional cascade level).
         bytes := ByteArray 6
@@ -386,14 +386,9 @@ class Mfrc522:
         response := transceive_anticollision_ bytes[..index] --last_byte_bits=valid_bits
         if not response: throw RfidException.no_response
 
-        error := registers_.read_u8 ERROR_REGISTER_
-        detected_collision := error & 0x08 != 0
-
-        //TODO: check bcc if no collision
-        //TODO: response + current byte must be 7? bytes.
-
-        // An anticollision frame is basically a select frame without the CRC.
-        // The PICCs are supposed to complete it. As such we expect the total to be 7 bytes.
+        // The PICC is supposed to complete the UID and add a checksum (BCC).
+        if response.size + valid_uid_bytes != 5:
+          throw RfidException.protocol
 
         // We start by assuming that the response is without collision. If there was one, we will
         // fix that later.
@@ -408,7 +403,12 @@ class Mfrc522:
         while uid_pos < 4:
           uid_buffer[uid_pos++] = response[response_index++]
 
-        if not detected_collision: return
+        error := registers_.read_u8 ERROR_REGISTER_
+        detected_collision := error & 0x08 != 0
+        if not detected_collision:
+          bcc := uid_buffer[0] ^ uid_buffer[1] ^ uid_buffer[2] ^ uid_buffer[3]
+          if bcc != response[response_index]: throw RfidException.checksum
+          return
 
         collision_value := registers_.read_u8 COLL_REGISTER_
         has_valid_collision_position := (collision_value & 0x20) == 0
@@ -437,7 +437,7 @@ class Mfrc522:
   cascade_select_ command/int uid_buffer/ByteArray -> ByteArray:
     // The frame frame consists of 9 bytes:
     // - 1 byte command.
-    // - 1 byte valid bits.
+    // - 1 byte valid bytes/bits. Since all bits are valid, always equal to 0x70.
     // - 4 bytes of UID (potentially the first one being a Cascade Tag, indicating that the UID needs
     //          an additional cascade level).
     // - 1 byte of BCC (Block Check Character).
