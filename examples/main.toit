@@ -24,10 +24,13 @@ main:
   // reader.self_test
 
   reader.on
+//  reader.antenna_off
+//   sleep --ms=1_000
+//  reader.antenna_on
 
   50.repeat:
     catch --trace:
-      print "reading"
+      // print "reading"
       data/ByteArray? := reader.is_new_card_present
       if data:
         data = reader.select

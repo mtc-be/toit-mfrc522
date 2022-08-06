@@ -11,6 +11,7 @@ import serial
 class Mfrc522:
   static COMMAND_REGISTER_ ::= 0x01 << 1
   static COM_IRQ_REGISTER_ ::= 0x04 << 1
+  static ERROR_REGISTER_ ::= 0x06 << 1
   static FIFO_DATA_REGISTER_ ::= 0x09 << 1
   static FIFO_LEVEL_REGISTER_ ::= 0x0A << 1
   static BIT_FRAMING_REGISTER_ ::= 0x0D << 1
@@ -42,23 +43,6 @@ class Mfrc522:
 
   constructor device/serial.Device:
     registers_ = device.registers
-
-  on_:
-
-    current_command := registers_.read_u8 COMMAND_REGISTER_
-    print "command: $(%x current_command)"
-    // command := 0x00
-    // // Bit 5 (RcvOff) must be set to 0 to turn on the analog part of the receiver.
-    // command |= 0b1000
-
-    reset_soft_
-
-    registers_.write_u8 COMMAND_REGISTER_ (current_command | 0b0000_1000)
-    print "after command 1000 receive $(%x registers_.read_u8 COMMAND_REGISTER_)"
-
-    old := registers_.read_u8 TX_CONTROL_REGISTER_
-    registers_.write_u8 TX_CONTROL_REGISTER_ (old | 0x3)
-    print "control $(%x registers_.read_u8 TX_CONTROL_REGISTER_)"
 
   on:
     reset_soft_
@@ -93,10 +77,6 @@ class Mfrc522:
     // A soft reset turns the antennas off.
     antenna_on
 
-  picc_request_a_:
-    old := registers_.read_u8 COLL_REGISTER_
-    registers_.write_u8 COLL_REGISTER_ (old & 0x7F)
-
   /*
   Short frame:
 
@@ -108,43 +88,38 @@ class Mfrc522:
   all other values: RFU (reserved for future use)
   */
 
+  /**
+  Computes the CRC as required by the ISO 14443-3 standard.
 
+  The chip actually has a hardware based CRC, but it's almost certainly faster to just do it here.
+  */
+  compute_crc_ data/ByteArray --to/int -> int:
+    // Specification 6.2.4 CRC_A.
+    // Also see Appendix B.
+    // Initial register shall be 0x6363.
+    // The polynomial is from ISO/IEC 13239: 0x8408
+    crc := 0x6363
+    to.repeat:
+      crc = crc ^ data[it]
+      8.repeat:
+        if (crc & 1) != 0:
+          crc = (crc >> 1) ^ 0x8408
+        else:
+          crc >>= 1
+    return crc
 
-  /// Needs $is_new_card_present to get a PICC into READY state.
-  /// (currently only $is_new_card_present) is implemented.
-  select:
-    // Section 6.5.3.1
-    SELECT_CASCADE1 ::= 0x93  // 4 byte UID.
-    SELECT_CASCADE2 ::= 0x95  // 7 byte UID.
-    SELECT_CASCADE3 ::= 0x97  // 10 byte UID.
+  check_crc_ data/ByteArray:
+    crc := compute_crc_ data --to=(data.size - 2)
+    if crc & 0xFF != data[data.size - 2] or crc >> 8 != data[data.size - 1]:
+      throw "BAD CRC"
 
-    valid_bytes := 2  // Including the command (SEL) and the number of valid bits.
-    valid_bits := 0
-    encoded_valid_bits := (valid_bytes << 4) + valid_bits
-
-    // The biggest frame consists of 9 bytes:
-    // - 1 byte command.
-    // - 1 byte valid bits.
-    // - 4 bytes of UID (potentially the first one being a Cascade Tag, indicating that the UID needs
-    //          an additional cascade level).
-    // - 1 byte of BCC (Block Check Character).
-    // - 2 bytes of CRC.
-    bytes := ByteArray 9
-    command := SELECT_CASCADE1
-    bytes[0] = command
-    bytes[1] = encoded_valid_bits
-
-    // TODO(florian): clear collision bits.
-
-    // Send all bits.
-    registers_.write_u8 BIT_FRAMING_REGISTER_ 0x00
-
+  transceive_ bytes -> bool:
     // Mostly copied from $is_new_card_present.
     // Need to reuse code more properly.
     registers_.write_u8 COMMAND_REGISTER_ COMMAND_IDLE_
     registers_.write_u8 COM_IRQ_REGISTER_ 0x7F
     registers_.write_u8 FIFO_LEVEL_REGISTER_ 0x80
-    registers_.write_bytes FIFO_DATA_REGISTER_ bytes[0..2]
+    registers_.write_bytes FIFO_DATA_REGISTER_ bytes
     registers_.write_u8 COMMAND_REGISTER_ COMMAND_TRANSCEIVE_
     registers_.write_u8 BIT_FRAMING_REGISTER_ (registers_.read_u8 BIT_FRAMING_REGISTER_) | 0x80
 
@@ -172,13 +147,219 @@ class Mfrc522:
       if (irqs & 0x01) != 0:
         throw "TIMEOUT"
       sleep --ms=3
-    print "completed: $completed"
-    if not completed: return null
+    return completed
 
-    // TODO(florian): we should check the fifo level.
-    result := ByteArray 5: registers_.read_u8 FIFO_DATA_REGISTER_
+  /**
+  Executes a select/anticollision.
 
-    return result
+  The cascade-level is encoded in the $command.
+  The $uid_buffer must be 4 bytes long and correspond to the current cascade level.
+
+  Returns whether another cascade is needed.
+  Returns null if no response was received. (A bit of a hack...).
+  // TODO(florian): should we switch to an exception?
+  */
+  cascade_ command/int uid_buffer/ByteArray --uid_is_known/bool -> bool?:
+      assert: uid_buffer.size == 4
+
+      known_bits := uid_is_known ? 8 * 4 : 0
+
+      // Complete this cascade level.
+      // That is, iterate until we have a unique UID for this cascade level.
+      // We might iterate this loop 32 times because of a collision for each bit.
+      while true:
+        index := 0
+        // The biggest frame consists of 9 bytes:
+        // - 1 byte command.
+        // - 1 byte valid bits.
+        // - 4 bytes of UID (potentially the first one being a Cascade Tag, indicating that the UID needs
+        //          an additional cascade level).
+        // - 1 byte of BCC (Block Check Character).
+        // - 2 bytes of CRC.
+        bytes := ByteArray 9
+        bytes[index++] = command
+
+        // Fully valid uid bytes.
+        valid_uid_bytes := known_bits / 8
+        // Additional valid bits.
+        valid_bits := known_bits % 8
+
+        // The valid bits are encoded with the higher nible containing the amount of fully valid bytes, and the
+        // the lower nibble containing the remaining bits.
+        // The encoded value includes the select-command and the valid-bits byte.
+        // If this is a full select (all bits are known), the value is updated below.
+        encoded_valid_bits := ((valid_uid_bytes + 2) << 4) + valid_bits
+        bytes[index++] = encoded_valid_bits
+
+        to_copy := valid_bits == 0 ? valid_uid_bytes : valid_uid_bytes + 1
+        for i := 0; i < to_copy; i++:
+          bytes[index++] = uid_buffer[i]
+
+        if known_bits >= 32:
+          // 7 bytes, since we also send the BCC.
+          // The CRC is not counted.
+          bytes[1] = 0x70
+
+          // We know all bits for this level.
+          // This is a "select" call, and not an anti-collision frame.
+          // A select also needs the BCC and the CRC.
+          bcc := bytes[2] ^ bytes[3] ^ bytes[4] ^ bytes[5]
+          bytes[index++] = bcc
+
+          assert: index == 7
+          crc := compute_crc_ bytes --to=index
+          bytes[index++] = crc & 0xFF
+          bytes[index++] = (crc >> 8) & 0xFF
+
+          // Send all bits.
+          registers_.write_u8 BIT_FRAMING_REGISTER_ 0x00
+
+          completed := transceive_ bytes
+
+          if not completed: return null
+          // TODO(florian): we should check the fifo level.
+          // We expect a SAK here.
+          response := ByteArray 3: registers_.read_u8 FIFO_DATA_REGISTER_
+          check_crc_ response
+          // The SAK must be exactly 3 bytes long.
+          if response.size != 3: throw "STATUS_ERROR"
+          // 6.5.3.4: if b3 is set then the UID is not complete.
+          return response[0] & 0x04 != 0
+
+        // We have an incomplete UID.
+        // Request the PICCs to complete the ID and watch for collisions.
+
+        // We want to send only 'tx_last_bits' bits. The remaining bits should be ignored.
+        tx_last_bits := valid_bits
+        // When receiving, the first bit sholud be shifted by 'rx_align'.
+        rx_align := valid_bits
+        registers_.write_u8 BIT_FRAMING_REGISTER_ ((rx_align << 4) | tx_last_bits)
+
+        completed := transceive_ bytes[0..index]
+        if not completed: return null
+
+        // TODO(florian): handle non-collision errors.
+        error := registers_.read_u8 ERROR_REGISTER_
+        // print "error: $error"
+
+        // TODO(florian): we should take the fifo level into account.
+        // print "level: $(registers_.read_u8 FIFO_LEVEL_REGISTER_)"
+
+        // An anticollision frame is basically a select frame without the CRC.
+        // The PICCs are supposed to complete it. As such we expect the total to be 7 bytes.
+
+        // We start by assuming that the response is without collision. If there was one, we will
+        // fix that later.
+        uid_pos := valid_uid_bytes
+        response := ByteArray (4 - uid_pos + 1): registers_.read_u8 FIFO_DATA_REGISTER_
+        // TODO(florian): we should check the BCC byte.
+        response_index := 0
+        if valid_bits != 0:
+          half_byte := response[response_index]
+          uid_buffer[uid_pos] &= (1 << valid_bits) - 1  // Clear the bits that were unknown.
+          uid_buffer[uid_pos] |= half_byte
+          uid_pos++
+          response_index++
+        while uid_pos < 4:
+          uid_buffer[uid_pos++] = response[response_index++]
+
+        had_collision := error & 0x08 != 0
+        if not had_collision:
+          known_bits = 32
+        else:
+          collision_value := registers_.read_u8 COLL_REGISTER_
+          has_valid_collision_position := (collision_value & 0x20) == 0
+          if not has_valid_collision_position:
+            // Collision detected, but without any valid position.
+            // Give up.
+            return null
+
+          collision_position := collision_value & 0x1F
+          // If the collision position is 0, then the collision happened at bit 32.
+          // See MFRC522 - 9.3.1.15, table 50.
+          if collision_position == 0: collision_position = 32
+          if collision_position <= known_bits: throw "STATE_ERROR"
+          if collision_position + known_bits > 32: throw "STATE_ERROR"
+          // Up to the collision position the bits were received correctly.
+          // At the collision point we now have to choose which branch we want to follow.
+          // We arbitrarily pick the one that we already wrote into the uid_buffer, and just
+          // state that this bit is now a known bit.
+          known_bits += collision_position
+
+  /// Needs $is_new_card_present to get a PICC into READY state.
+  /// (currently only $is_new_card_present) is implemented.
+  select uid/ByteArray=#[]:
+    // Section 6.5.3.1
+    // A UID is either 4, 7, or 10 bytes long.
+    // A cascade level has only space for 4 bytes of payload.
+    // If the UID is 4 bytes long, we can just send it in the first cascade.
+    // If it's longer, we use the cascade tag as first byte of the payload to
+    // indicate that another cascade level follows. The same is true for the second cascade level.
+    // If it's 7 bytes long, we already sent 3 bytes in the first cascade, and can use the remaining
+    // 4 bytes for the rest. Otherwise, we send again a cascade tag, followed by the next 3 bytes.
+    //
+    // Note that the cascade tag is not a valid byte at 0'th and 4'th position to avoid ambiguity.
+    //
+    // When sending a select command we send as much of the UID as we already know. All
+    // PICCs that fit the (partial) UID respond with the rest of the UID. The PCD then detects
+    // collisions, and we arbitrarily pick one of the colliding PICCs.
+    // Over time we end up increasing the amount of known bits.
+    CASCADE_TAG ::= 0x88
+
+    SELECT_CASCADE1 ::= 0x93  // 4 byte UID.
+    SELECT_CASCADE2 ::= 0x95  // 7 byte UID.
+    SELECT_CASCADE3 ::= 0x97  // 10 byte UID.
+
+    // Create a uid-buffer which represents more closely what we actually send.
+    // If we don't have any UID, also make sure we have space to write for the received data.
+    uid_buffer/ByteArray := ?
+    if uid.size == 0: uid_buffer = ByteArray 12
+    else if uid.size == 4: uid_buffer = uid
+    else if uid.size == 7: uid_buffer = #[CASCADE_TAG] + uid
+    else if uid.size == 10:
+      uid_buffer = #[CASCADE_TAG] + uid[0..3] + #[CASCADE_TAG] + uid[3..]
+    else:
+      throw "INVALID_ARGUMENT"
+
+    // We can now send the chunks nicely, 4 bytes each.
+    assert: uid_buffer.size % 4 == 0
+
+    // The known bits, including cascade tags, of the UID.
+    known_bits := uid.size == 0 ? 0 : uid_buffer.size * 8
+
+    // C code clears bits received after a collision.
+    // Don't think we need that.
+    // PCD_ClearRegisterBitMask(CollReg, 0x80);
+    // registers_.write_u8 COLL_REGISTER_ ((registers_.read_u8 COLL_REGISTER_) & 0x7F)
+
+    // Go through the different cascade levels.
+    // If the ID is shorter we break out of the loop.
+    for cascade_level := 1; cascade_level <= 3; cascade_level++:
+      command /int := ?
+      if cascade_level == 1: command = SELECT_CASCADE1
+      else if cascade_level == 2: command = SELECT_CASCADE2
+      else: command = SELECT_CASCADE3
+
+      needs_another_cascade := cascade_ command --uid_is_known=(uid.size != 0)
+          uid_buffer[(cascade_level - 1) * 4..cascade_level * 4]
+
+      if needs_another_cascade == null: return null
+      if not needs_another_cascade:
+        // Temporarily put the PICC into halt.
+        hlta := #[0x50, 0x00, 0x00, 0x00]
+        crc := compute_crc_ hlta --to=2
+        hlta[2] = crc & 0xFF
+        hlta[3] = crc >> 8
+        transceive_ hlta
+
+        // Remove the cascade tags.
+        if cascade_level == 1: return uid_buffer[0..4].copy
+        else if cascade_level == 2: return uid_buffer[1..8].copy
+        else: return uid_buffer[1..4] + uid_buffer[5..]
+
+      if cascade_level == 3: throw "STATE_ERROR"
+
+    unreachable
 
   /**
   Returns null if not present.
@@ -350,7 +531,6 @@ class Mfrc522:
 
     for i := 0; i < 10; i++:
       level := registers_.read_u8 FIFO_LEVEL_REGISTER_
-      print "level: $level"
       if level == 64: break
       sleep --ms=100
 
