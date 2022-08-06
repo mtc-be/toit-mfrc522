@@ -153,7 +153,7 @@ class Mfrc522:
 
   See section Iso 14443-3 2008; section 6.2.3.1.
   */
-  transceive_short command/int --allow_collision -> ByteArray?:
+  transceive_short_ command/int --allow_collision -> ByteArray?:
     if command >= 0x80: throw "INVALID_ARGUMENT"
 
     // Send only 7 bits of the last (only) byte.
@@ -168,7 +168,7 @@ class Mfrc522:
 
   If $check_crc is true, then automatically checks the crc of the response.
   */
-  transceive_standard bytes/ByteArray --check_crc/bool=false -> ByteArray?:
+  transceive_standard_ bytes/ByteArray --check_crc/bool=false -> ByteArray?:
     crc := compute_crc_ bytes[..bytes.size - 2]
     bytes[bytes.size - 2] = crc & 0xFF
     bytes[bytes.size - 1] = (crc >> 8) & 0xFF
@@ -184,7 +184,7 @@ class Mfrc522:
     sending only those last bits are used. During receiving the first bits are shifted as to
     complete the byte.
   */
-  transceive_anticollision bytes/ByteArray --last_byte_bits/int -> ByteArray?:
+  transceive_anticollision_ bytes/ByteArray --last_byte_bits/int -> ByteArray?:
     // We want to send only 'tx_last_bits' bits. The remaining bits should be ignored.
     tx_last_bits := last_byte_bits
     // When receiving, the first bit sholud be shifted by 'rx_align' which is the same as the
@@ -341,33 +341,29 @@ class Mfrc522:
       throw RfidException.checksum
 
   /**
-  Executes a select/anticollision.
+  Executes an anticollision to get the UID of a PICC in the field.
 
   The cascade-level is encoded in the $command.
   The $uid_buffer must be 4 bytes long and correspond to the current cascade level.
 
-  Returns whether another cascade is needed.
-  Returns null if no response was received. (A bit of a hack...).
-  // TODO(florian): should we switch to an exception?
+  Returns when the $uid_buffer is filled.
   */
-  cascade_ command/int uid_buffer/ByteArray --uid_is_known/bool -> bool:
+  cascade_get_uid_ command/int uid_buffer/ByteArray -> none:
       assert: uid_buffer.size == 4
 
-      known_bits := uid_is_known ? 8 * 4 : 0
+      known_bits := 0
 
       // Complete this cascade level.
       // That is, iterate until we have a unique UID for this cascade level.
       // We might iterate this loop 32 times because of a collision for each bit.
       while true:
         index := 0
-        // The biggest frame consists of 9 bytes:
+        // The biggest outbound frame consists of 6 bytes:
         // - 1 byte command.
         // - 1 byte valid bits.
         // - 4 bytes of UID (potentially the first one being a Cascade Tag, indicating that the UID needs
         //          an additional cascade level).
-        // - 1 byte of BCC (Block Check Character).
-        // - 2 bytes of CRC.
-        bytes := ByteArray 9
+        bytes := ByteArray 6
         bytes[index++] = command
 
         // Fully valid uid bytes.
@@ -386,39 +382,15 @@ class Mfrc522:
         for i := 0; i < to_copy; i++:
           bytes[index++] = uid_buffer[i]
 
-        if known_bits >= 32:
-          // 7 bytes, since we also send the BCC.
-          // The CRC is not counted.
-          bytes[1] = 0x70
-
-          // We know all bits for this level.
-          // This is a "select" call, and not an anti-collision frame.
-          // A select also needs the BCC and the CRC.
-          bcc := bytes[2] ^ bytes[3] ^ bytes[4] ^ bytes[5]
-          bytes[index++] = bcc
-
-          assert: index == 7
-          response := transceive_standard bytes[..index + 2] --check_crc
-
-          if not response: throw RfidException.no_response
-          // The SAK must be exactly 3 bytes long.
-          if response.size != 3: throw RfidException.protocol
-          // 6.5.3.4: if b3 is set then the UID is not complete.
-          return response[0] & 0x04 != 0
-
-        // We have an incomplete UID.
         // Request the PICCs to complete the ID and watch for collisions.
-
-        response := transceive_anticollision bytes[..index] --last_byte_bits=valid_bits
+        response := transceive_anticollision_ bytes[..index] --last_byte_bits=valid_bits
         if not response: throw RfidException.no_response
 
         error := registers_.read_u8 ERROR_REGISTER_
         detected_collision := error & 0x08 != 0
 
-        // print "error: $error"
-
-        // TODO(florian): we should take the fifo level into account.
-        // print "level: $(registers_.read_u8 FIFO_LEVEL_REGISTER_)"
+        //TODO: check bcc if no collision
+        //TODO: response + current byte must be 7? bytes.
 
         // An anticollision frame is basically a select frame without the CRC.
         // The PICCs are supposed to complete it. As such we expect the total to be 7 bytes.
@@ -426,8 +398,6 @@ class Mfrc522:
         // We start by assuming that the response is without collision. If there was one, we will
         // fix that later.
         uid_pos := valid_uid_bytes
-        // response := ByteArray (4 - uid_pos + 1): registers_.read_u8 FIFO_DATA_REGISTER_
-        // TODO(florian): we should check the BCC byte.
         response_index := 0
         if valid_bits != 0:
           half_byte := response[response_index]
@@ -438,31 +408,68 @@ class Mfrc522:
         while uid_pos < 4:
           uid_buffer[uid_pos++] = response[response_index++]
 
-        if not detected_collision:
-          known_bits = 32
-        else:
-          collision_value := registers_.read_u8 COLL_REGISTER_
-          has_valid_collision_position := (collision_value & 0x20) == 0
-          if not has_valid_collision_position:
-            // Collision detected, but without any valid position.
-            // Give up.
-            throw RfidException.internal
+        if not detected_collision: return
 
-          collision_position := collision_value & 0x1F
-          // If the collision position is 0, then the collision happened at bit 32.
-          // See MFRC522 - 9.3.1.15, table 50.
-          if collision_position == 0: collision_position = 32
-          if collision_position <= known_bits: throw "STATE_ERROR"
-          if collision_position + known_bits > 32: throw "STATE_ERROR"
-          // Up to the collision position the bits were received correctly.
-          // At the collision point we now have to choose which branch we want to follow.
-          // We arbitrarily pick the one that we already wrote into the uid_buffer, and just
-          // state that this bit is now a known bit.
-          known_bits += collision_position
+        collision_value := registers_.read_u8 COLL_REGISTER_
+        has_valid_collision_position := (collision_value & 0x20) == 0
+        if not has_valid_collision_position:
+          // Collision detected, but without any valid position.
+          // Give up.
+          throw RfidException.internal
 
-  /// Needs $is_new_card_present to get a PICC into READY state.
-  /// (currently only $is_new_card_present) is implemented.
-  select uid/ByteArray=#[]:
+        collision_position := collision_value & 0x1F
+        // If the collision position is 0, then the collision happened at bit 32.
+        // See MFRC522 - 9.3.1.15, table 50.
+        if collision_position == 0: collision_position = 32
+        if collision_position <= known_bits: throw "STATE_ERROR"
+        if collision_position + known_bits > 32: throw "STATE_ERROR"
+        // Up to the collision position the bits were received correctly.
+        // At the collision point we now have to choose which branch we want to follow.
+        // We arbitrarily pick the one that we already wrote into the uid_buffer, and just
+        // state that this bit is now a known bit.
+        known_bits += collision_position
+
+  /**
+  Transceives the select for this cascade level.
+
+  Returns the received SAK (select acknowledge).
+  */
+  cascade_select_ command/int uid_buffer/ByteArray -> ByteArray:
+    // The frame frame consists of 9 bytes:
+    // - 1 byte command.
+    // - 1 byte valid bits.
+    // - 4 bytes of UID (potentially the first one being a Cascade Tag, indicating that the UID needs
+    //          an additional cascade level).
+    // - 1 byte of BCC (Block Check Character).
+    // - 2 bytes of CRC.
+    bytes := ByteArray 9
+
+    bytes[0] = command
+
+    // 7 bytes, since we also send the BCC.
+    // The CRC is not counted.
+    bytes[1] = 0x70
+
+    bytes.replace 2 uid_buffer
+
+    // We know all bits for this level.
+    // This is a "select" call, and not an anti-collision frame.
+    // A select also needs the BCC and the CRC.
+    bcc := bytes[2] ^ bytes[3] ^ bytes[4] ^ bytes[5]
+    bytes[6] = bcc
+    response := transceive_standard_ bytes --check_crc
+
+    if not response: throw RfidException.no_response
+    // The SAK must be exactly 3 bytes long.
+    if response.size != 3: throw RfidException.protocol
+    return response
+
+  /**
+  Selects one of the woken PICCs.
+
+  PICCs can be woken either by sending a REQA or WUPA. See $(do --new [block]) and $with_picc.
+  */
+  select_ uid/ByteArray=#[] -> Picc?:
     // Section 6.5.3.1
     // A UID is either 4, 7, or 10 bytes long.
     // A cascade level has only space for 4 bytes of payload.
@@ -514,42 +521,79 @@ class Mfrc522:
       else if cascade_level == 2: command = SELECT_CASCADE2
       else: command = SELECT_CASCADE3
 
-      needs_another_cascade := cascade_ command --uid_is_known=(uid.size != 0)
-          uid_buffer[(cascade_level - 1) * 4..cascade_level * 4]
+      cascade_uid_buffer := uid_buffer[(cascade_level - 1) * 4 .. cascade_level * 4]
 
-      if needs_another_cascade == null: return null
-      if not needs_another_cascade:
-        // Temporarily put the PICC into halt.
-        hlta := #[0x50, 0x00, 0x00, 0x00]
-        // The transceive will wait for a response, timing out.
-        // However, that's not a bad thing to do anyway, as we should give the PICC time to
-        // go into HALT state.
-        transceive_standard hlta
+      // Unless we already have the UID, perform an anticollision to get one UID in the field.
+      if uid.size == 0:
+        cascade_get_uid_ command cascade_uid_buffer
 
-        // Remove the cascade tags.
-        if cascade_level == 1: return uid_buffer[0..4].copy
-        else if cascade_level == 2: return uid_buffer[1..8].copy
-        else: return uid_buffer[1..4] + uid_buffer[5..]
+      // Select acknowledge.
+      sak := cascade_select_ command cascade_uid_buffer
 
-      if cascade_level == 3: throw "STATE_ERROR"
+      // 6.5.3.4: if b3 is set then the UID is not complete.
+      needs_another_cascade := sak[0] & 0x04 != 0
+
+      if needs_another_cascade:
+        if cascade_level == 3: throw RfidException.protocol
+        continue
+
+      // Remove the cascade tags.
+      if cascade_level == 1: uid = uid_buffer[0..4].copy
+      else if cascade_level == 2: uid = uid_buffer[1..8].copy
+      else: uid = uid_buffer[1..4] + uid_buffer[5..]
+
+      return Picc uid sak[0]
 
     unreachable
 
   /**
-  Returns null if not present.
-  Returns the ATQA (Answer to Request) otherwise.
-
-  Leaves one or several PICCs in READY state (from IDLE to READY).
-  Still need to do anti-collision or go to ACTIVE state.
+  Sends a HLTA (halt-a) command to the PICC.
   */
-  is_new_card_present -> bool:
-    reset_communication_
+  halt_ -> none:
+    hlta := #[0x50, 0x00, 0x00, 0x00]
+    // The transceive will wait for a response, timing out.
+    // However, that's not a bad thing to do anyway, as we should give the PICC time to
+    // go into HALT state.
+    transceive_standard_ hlta
 
+  /**
+  Wakes up all new PICCs and executes the given $block for each.
+
+  The $block is called with the UID of the PICC as argument.
+  */
+  do --new/bool [block] -> none:
+    if not new: throw "INVALID_ARGUMENT"
+
+    while true:
+      reset_communication_
+      // Wake up new PICCs.
+      // ISO 14443-3
+      PICC_CMD_REQA ::= 0x26
+      // We don't really care for the response.
+      if (transceive_short_ PICC_CMD_REQA --allow_collision) == null: return
+      uid := select_
+      try:
+        block.call uid
+      finally:
+        halt_
+
+  /**
+  Wakes up all PICCs and selects the PICC with the given $uid. Then executes the given $block.
+
+  The $block is called with the UID of the PICC as argument.
+  */
+  with_picc uid/ByteArray [block] -> none:
+    reset_communication_
+    // Wake up the given PICC.
     // ISO 14443-3
-    PICC_CMD_REQA ::= 0x26
-    response := transceive_short PICC_CMD_REQA --allow_collision
+    PICC_CMD_WUPA ::= 0x52
     // We don't really care for the response.
-    return response != null
+    if (transceive_short_ PICC_CMD_WUPA --allow_collision) == null: return
+    select_ uid
+    try:
+      block.call uid
+    finally:
+      halt_
 
   antenna_on:
     current := registers_.read_u8 TX_CONTROL_REGISTER_
@@ -721,3 +765,85 @@ class SelfTestData:
   bytes/ByteArray
 
   constructor .version .bytes:
+
+
+class Picc:
+  /** Unknown type of PICC. */
+  static TYPE_UNKNOWN	::= 0
+
+  /** MIFARE Ultralight or Ultralight C. */
+  static TYPE_MIFARE_UL ::= 1
+  /** MIFARE Classic protocol, 320 bytes. */
+  static TYPE_MIFARE_MINI ::= 2
+  /** MIFARE Classic protocol, 1KB. */
+  static TYPE_MIFARE_1K	::= 3
+  /** MIFARE Classic protocol, 4KB. */
+  static TYPE_MIFARE_4K ::= 4
+  /** MIFARE Plus (2KB or 4KB) or MIFARE DESFire */
+  static TYPE_MIFARE_PLUS_DESFIRE ::= 5
+
+  /** The UID of this PICC. */
+  uid/ByteArray
+  sak_/int
+
+  constructor uid/ByteArray sak/int:
+    if sak & 0x80 != 0: return Mifare uid sak
+    return Picc.private_ uid sak
+
+  constructor.private_ .uid .sak_:
+
+  /** Whether this PICC is ISO-14443-4 compliant. */
+  is_iso_14443_4_compliant -> bool:
+    return sak_ & 0b00100100 == 0b00100000
+
+  /** Whether this PICC is ISO-18092 (NFC) compliant. */
+  is_iso_18092_compliant -> bool:
+    return sak_ & 0b01000100 == 0b01000100
+
+  /**
+  The type of this PICC.
+
+  Note that MIFARE Plus PICCs might report themselves as generic PICCs for privace reasons.
+  */
+  type -> int: return sak_to_type_ sak_ uid
+
+  static sak_to_type_ sak/int uid/ByteArray -> int:
+    // See NXP AN 10833 - MIFARE Type ID Procedure.
+    type_bits := sak & 0x7F
+    if type_bits == 0x00: return TYPE_MIFARE_UL
+    if type_bits == 0x09: return TYPE_MIFARE_MINI
+    if type_bits == 0x08: return uid.size == 4 ? TYPE_MIFARE_1K : TYPE_MIFARE_PLUS_DESFIRE
+    if type_bits == 0x18: return uid.size == 4 ? TYPE_MIFARE_4K : TYPE_MIFARE_PLUS_DESFIRE
+    if type_bits == 0x10: return TYPE_MIFARE_PLUS_DESFIRE
+    if type_bits == 0x11: return TYPE_MIFARE_PLUS_DESFIRE
+    if type_bits == 0x20: return TYPE_MIFARE_PLUS_DESFIRE
+    return TYPE_UNKNOWN
+
+  static type_to_str_ t/int -> string:
+    if t == TYPE_UNKNOWN: return "Unknown PICC"
+    if t == TYPE_MIFARE_MINI: return "MIFARE Mini, 320 bytes"
+    if t == TYPE_MIFARE_1K: return "MIFARE 1KB"
+    if t == TYPE_MIFARE_4K: return "MIFARE 4KB"
+    if t == TYPE_MIFARE_PLUS_DESFIRE: return "MIFARE Plus or DESFire"
+    if t == TYPE_MIFARE_UL: return "MIFARE Ultralight or Ultralight C"
+    unreachable
+
+  // This functions shows if a PICC is compliant with ISO/IEC 14443-4.
+  stringify -> string:
+    uid_str := ""
+    uid.do: uid_str += "$(%02x it)"
+    return "UID: $uid_str - $(type_to_str_ type)"
+
+class Mifare extends Picc:
+  constructor uid/ByteArray sak/int:
+    super.private_ uid sak
+
+  dump:
+    no_of_sectors := ?
+    if type == Picc.TYPE_MIFARE_MINI: no_of_sectors = 1
+    else if type == Picc.TYPE_MIFARE_1K: no_of_sectors = 16
+    else if type == Picc.TYPE_MIFARE_4K: no_of_sectors = 40
+    else: unreachable
+
+    // no_of_sectors.repeat:
+      // TODO(florian)

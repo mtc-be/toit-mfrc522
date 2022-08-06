@@ -21,20 +21,24 @@ main:
 
   reader := mfrc522.Mfrc522 device
 
-  // reader.self_test
+  reader.self_test
 
   reader.on
 
   iteration := 0
   while true:
     iteration++
+
     catch --trace:
-      // print "reading"
-      while reader.is_new_card_present:
-        data := reader.select
-        print "--------------- $iteration $data"
+      found_piccs := []
+      reader.do --new:
+        print "--------------- $iteration $it"
+        found_piccs.add it
+
+      found_piccs.do:
+        reader.with_picc it.uid:
+          print "activated picc $it again"
 
     reader.antenna_off
     sleep --ms=2_000
     reader.antenna_on
-    sleep --ms=1_000
