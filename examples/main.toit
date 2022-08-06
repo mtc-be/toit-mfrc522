@@ -24,16 +24,17 @@ main:
   // reader.self_test
 
   reader.on
-//  reader.antenna_off
-//   sleep --ms=1_000
-//  reader.antenna_on
 
-  50.repeat:
+  iteration := 0
+  while true:
+    iteration++
     catch --trace:
       // print "reading"
-      data/ByteArray? := reader.is_new_card_present
-      if data:
+      while data/ByteArray? := reader.is_new_card_present:
         data = reader.select
-        print data
+        print "--------------- $iteration $data"
 
+    reader.antenna_off
     sleep --ms=2_000
+    reader.antenna_on
+    sleep --ms=1_000

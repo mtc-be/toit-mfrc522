@@ -8,6 +8,65 @@ A driver for the MFRC522 RFID reader.
 
 import serial
 
+class RfidException:
+  /**
+  Error when a device did not respond.
+
+  This can happen if the user requested to wake a specific device, or if
+    the anti-collision protocol selected one of two PICCs, but none responded at
+    the next step.
+  */
+  static NO_RESPONSE ::= 0
+
+  /** A checksum (parity, or CRC) error was detected. */
+  static CHECKSUM ::= 1
+
+  /**
+  A protocol error was detected.
+
+  A PICC responded in an unexpected way. Most often, this is actually caused by
+    a communication error; for example, when too many PICCs are in the field.
+  */
+  static PROTOCOL ::= 2
+
+  /** A timeout was detected. */
+  static TIMEOUT_ERROR ::= 3
+
+  /** A collision was detected. */
+  static COLLISION ::= 4
+
+  /**
+  An internal error was detected.
+
+  If encountered, please file a bug; ideally with a reproducible example.
+  */
+  static INTERNAL ::= 5
+
+  /**
+  The internal temperature sensor detected overheating and shut down the antenna drivers.
+  */
+  static TEMPERATURE ::= 6
+
+  code/int
+
+  constructor.no_response: code = NO_RESPONSE
+  constructor.checksum:    code = CHECKSUM
+  constructor.protocol:    code = PROTOCOL
+  constructor.timeout:     code = TIMEOUT_ERROR
+  constructor.collision:   code = COLLISION
+  constructor.internal:    code = INTERNAL
+  constructor.temperature: code = TEMPERATURE
+
+  stringify -> string:
+    if code == NO_RESPONSE: return "No response from PICC"
+    if code == CHECKSUM: return "Checksum error"
+    if code == PROTOCOL: return "Protocol error"
+    if code == TIMEOUT_ERROR: return "Timeout"
+    if code == COLLISION: return "Collision"
+    if code == INTERNAL: return "Internal error"
+    if code == TEMPERATURE: return "Temperature error; antenna is off due to overheating"
+    unreachable
+
 class Mfrc522:
   static COMMAND_REGISTER_ ::= 0x01 << 1
   static COM_IRQ_REGISTER_ ::= 0x04 << 1
@@ -77,52 +136,103 @@ class Mfrc522:
     // A soft reset turns the antennas off.
     antenna_on
 
-  /*
-  Short frame:
+  /**
+  Transmits a short frame and returns the response.
 
-  0x26: REQ
-  0x52: WUPA
-  0x35: Optional timeslot method. (see Annex C of iso14443-3)
-  0x40 to 0x4F: Proprietary.
-  0x78 to 0x7F: Proprietary.
-  all other values: RFU (reserved for future use)
+  A short frame consists of just 7 bits of data. It doesn't have any CRC or parity bit.
+
+  Common short-frame commands:
+  - REQA (0x26): Request any new PICC to go into IDLE state.
+  - WUPA (0x52): Requests any PICC to go into IDLE state.
+
+  Other values:
+  - 0x35: Optional timeslot method. (see Annex C of iso14443-3)
+  - 0x40 to 0x4F: Proprietary.
+  - 0x78 to 0x7F: Proprietary.
+  - all other values: RFU (reserved for future use).
+
+  See section Iso 14443-3 2008; section 6.2.3.1.
   */
+  transceive_short command/int -> ByteArray?:
+    if command >= 0x80: throw "INVALID_ARGUMENT"
+
+    // Send only 7 bits of the last (only) byte.
+    set_framing_ --tx_last_bits=7
+
+    return transceive_ #[command]
 
   /**
-  Computes the CRC as required by the ISO 14443-3 standard.
+  Transmits a standard frame and returns the response.
 
-  The chip actually has a hardware based CRC, but it's almost certainly faster to just do it here.
+  Automatically fills in the CRC.
+
+  If $check_crc is true, then automatically checks the crc of the response.
   */
-  compute_crc_ data/ByteArray --to/int -> int:
-    // Specification 6.2.4 CRC_A.
-    // Also see Appendix B.
-    // Initial register shall be 0x6363.
-    // The polynomial is from ISO/IEC 13239: 0x8408
-    crc := 0x6363
-    to.repeat:
-      crc = crc ^ data[it]
-      8.repeat:
-        if (crc & 1) != 0:
-          crc = (crc >> 1) ^ 0x8408
-        else:
-          crc >>= 1
-    return crc
+  transceive_standard bytes/ByteArray --check_crc/bool=false -> ByteArray?:
+    crc := compute_crc_ bytes[..bytes.size - 2]
+    bytes[bytes.size - 2] = crc & 0xFF
+    bytes[bytes.size - 1] = (crc >> 8) & 0xFF
 
-  check_crc_ data/ByteArray:
-    crc := compute_crc_ data --to=(data.size - 2)
-    if crc & 0xFF != data[data.size - 2] or crc >> 8 != data[data.size - 1]:
-      throw "BAD CRC"
+    return transceive_ bytes --check_crc=check_crc
 
-  transceive_ bytes -> bool:
-    // Mostly copied from $is_new_card_present.
-    // Need to reuse code more properly.
+  /**
+  Sets the framing for future transmissions.
+
+  The $rx_align parameter is used for handling collisions. It should otherwise always be 0.
+    The first received bit is shifted by $rx_align positions. For example, if it is 6, then the
+    first 2 received bits are stored as MSB bits of the first byte, and the remaining received bits
+    are stored in subsequent bytes.
+
+  The $tx_last_bits parameter defines the number of bits of the last byte that should be transmitted.
+    If it is equal to 0, then the whole byte is transmitted. This value is 7 for short frames (since
+    they have only 7 data bits), 0 for standard frames, and any value for anticollision frames.
+  */
+  set_framing_ --rx_align/int=0 --tx_last_bits/int=0:
+    if not 0 <= rx_align < 8: throw "INVALID_ARGUMENT"
+    if not 0 <= tx_last_bits < 8: throw "INVALID_ARGUMENT"
+
+    // Bit 7: StartSend == 0. (If 1, starts the transmission of data; only valid in
+    //     combination with the Transceive command).
+    // Bit 6-4: RxAlign. Used for reception of bit-oriented frames.
+    //    Usually 0, except for bitwise anticollision at 106bBd.
+    //    0: LSB of the received bit is stored at bit position 0; second at position 1.
+    //    1: LSB of the received bit is stored at bit position 1; second at position 2.
+    //    7: LSB of the received bit is stored at bit position 7; the second received bit is
+    //        stored in the next byte that follows a bit position 0.
+    // Bit 3: reserved for future use.
+    // Bit 2-0: TxLastBits. Used for transmission of bit oriented frames: defines the number of
+    //     bits of the last byte that will be transmitted. 0 indicates that all bits should be transmitted.
+    // The PICC_CMD_REQA should be sent in a "short frame" which has only 7 bits.
+    // Iso-14443-3, 6.4.1. "The REQA and WUPA commands [..] are transmitted within a short frame".
+    registers_.write_u8 BIT_FRAMING_REGISTER_ ((rx_align << 4) | tx_last_bits)
+
+  transceive_ bytes/ByteArray --allow_collision/bool=false --check_crc/bool=false -> ByteArray?:
+    // The FIFO can handle up to 64 bytes.
+    if bytes.size > 64: throw "INVALID_ARGUMENT"
+    // Cancel any existing command.
     registers_.write_u8 COMMAND_REGISTER_ COMMAND_IDLE_
+
+    // Clear all irq bits.
+    // The MSB of the register is 0, indicating that all marked bits are cleared.
     registers_.write_u8 COM_IRQ_REGISTER_ 0x7F
+
+    // Flush the FIFO buffer.
+    // "Immediately clears the internal FIFO buffer's read and write pointer and ErrorReg register's BufferOvfl bit."
     registers_.write_u8 FIFO_LEVEL_REGISTER_ 0x80
+
+    // Write the data into the FIFO.
     registers_.write_bytes FIFO_DATA_REGISTER_ bytes
+
+    // Send the command.
     registers_.write_u8 COMMAND_REGISTER_ COMMAND_TRANSCEIVE_
+
+    // Execute the transceive.
+    // 9.3.1.14:
+    //   Bit 7: StartSend: If 1, starts the transmission of data; only valid in
+    //       combination with the Transceive command.
     registers_.write_u8 BIT_FRAMING_REGISTER_ (registers_.read_u8 BIT_FRAMING_REGISTER_) | 0x80
 
+    // Wait for the response:
     completed := false
     for i := 0; i < 10; i++:
       irqs := registers_.read_u8 COM_IRQ_REGISTER_
@@ -145,9 +255,71 @@ class Mfrc522:
       // Timeout. Remember that we automatically start the timeout due to the initialization
       // in the $on function.
       if (irqs & 0x01) != 0:
-        throw "TIMEOUT"
+        throw RfidException.timeout
       sleep --ms=3
-    return completed
+
+    if not completed: return null
+
+    error := registers_.read_u8 ERROR_REGISTER_
+    /*
+    Section 9.3.1.7. Table 34.
+    * Bit 7 - WrErr: data is written into the FIFO buffer by the host at an invalid point in time.
+    * Bit 6 - TempErr: internal temperature sensor detects overheating, in which case the antenna drivers are
+        automatically turned off.
+    * Bit 5 - reserved.
+    * Bit 4 - BufferOvfl: the host (or the MFRC522's internal state machine) tries to write data into to
+        FIFO even though it's already full.
+    * Bit 3 - CollErr: collision error. The MFRC522's internal state machine detected a collision.
+    * Bit 2 - CRCErr: CRC error. The CRC check of the received data failed.
+    * Bit 1 - ParityErr: parity error. The received data has an invalid parity.
+    * Bit 0 - ProtocolErr: SOF is incorrect. (Used for MFAuthent).
+    */
+
+    detected_collision := error & 0x08 != 0
+    if detected_collision and not allow_collision:
+      throw RfidException.collision
+    if detected_collision:
+      // Ignore parity errors. They might be caused by the collision.
+      error &= ~0x02
+
+    // For bit 7 and 4 something is writing even though it shouldn't.
+    if error & 0x80 != 0 or error & 0x10 != 0: throw RfidException.internal
+    if error & 0x40 != 0:                      throw RfidException.temperature
+    if error & 0x04 != 0 or error & 0x02 != 0: throw RfidException.checksum
+    if error & 0x01 != 0:                      throw RfidException.protocol
+
+    response_size := registers_.read_u8 FIFO_LEVEL_REGISTER_
+    // We must not use `read_bytes` for SPI. That doesn't yield the correct result.
+    result := ByteArray response_size: registers_.read_u8 FIFO_DATA_REGISTER_
+
+    if check_crc: check_crc_ result
+    return result
+
+  /**
+  Computes the CRC as required by the ISO 14443-3 standard.
+
+  The chip actually has a hardware based CRC, but it's almost certainly faster to just do it here.
+  */
+  compute_crc_ data/ByteArray -> int:
+    // Specification 6.2.4 CRC_A.
+    // Also see Appendix B.
+    // Initial register shall be 0x6363.
+    // The polynomial is from ISO/IEC 13239: 0x8408
+    crc := 0x6363
+    data.size.repeat:
+      crc = crc ^ data[it]
+      8.repeat:
+        if (crc & 1) != 0:
+          crc = (crc >> 1) ^ 0x8408
+        else:
+          crc >>= 1
+    return crc
+
+  check_crc_ data/ByteArray:
+    if data.size < 3: throw RfidException.protocol
+    crc := compute_crc_ data[..data.size - 2]
+    if crc & 0xFF != data[data.size - 2] or crc >> 8 != data[data.size - 1]:
+      throw RfidException.checksum
 
   /**
   Executes a select/anticollision.
@@ -207,22 +379,17 @@ class Mfrc522:
           bytes[index++] = bcc
 
           assert: index == 7
-          crc := compute_crc_ bytes --to=index
+          crc := compute_crc_ bytes[..index]
           bytes[index++] = crc & 0xFF
           bytes[index++] = (crc >> 8) & 0xFF
 
           // Send all bits.
           registers_.write_u8 BIT_FRAMING_REGISTER_ 0x00
 
-          completed := transceive_ bytes
-
-          if not completed: return null
-          // TODO(florian): we should check the fifo level.
-          // We expect a SAK here.
-          response := ByteArray 3: registers_.read_u8 FIFO_DATA_REGISTER_
-          check_crc_ response
+          response := transceive_ --check_crc bytes
+          if not response: throw RfidException.no_response
           // The SAK must be exactly 3 bytes long.
-          if response.size != 3: throw "STATUS_ERROR"
+          if response.size != 3: throw RfidException.protocol
           // 6.5.3.4: if b3 is set then the UID is not complete.
           return response[0] & 0x04 != 0
 
@@ -235,11 +402,14 @@ class Mfrc522:
         rx_align := valid_bits
         registers_.write_u8 BIT_FRAMING_REGISTER_ ((rx_align << 4) | tx_last_bits)
 
-        completed := transceive_ bytes[0..index]
-        if not completed: return null
+        response := transceive_ --allow_collision bytes[0..index]
+        if not response:
+          if known_bits != 0: throw RfidException.no_response
+          return null
 
-        // TODO(florian): handle non-collision errors.
         error := registers_.read_u8 ERROR_REGISTER_
+        detected_collision := error & 0x08 != 0
+
         // print "error: $error"
 
         // TODO(florian): we should take the fifo level into account.
@@ -251,7 +421,7 @@ class Mfrc522:
         // We start by assuming that the response is without collision. If there was one, we will
         // fix that later.
         uid_pos := valid_uid_bytes
-        response := ByteArray (4 - uid_pos + 1): registers_.read_u8 FIFO_DATA_REGISTER_
+        // response := ByteArray (4 - uid_pos + 1): registers_.read_u8 FIFO_DATA_REGISTER_
         // TODO(florian): we should check the BCC byte.
         response_index := 0
         if valid_bits != 0:
@@ -263,8 +433,7 @@ class Mfrc522:
         while uid_pos < 4:
           uid_buffer[uid_pos++] = response[response_index++]
 
-        had_collision := error & 0x08 != 0
-        if not had_collision:
+        if not detected_collision:
           known_bits = 32
         else:
           collision_value := registers_.read_u8 COLL_REGISTER_
@@ -275,6 +444,7 @@ class Mfrc522:
             return null
 
           collision_position := collision_value & 0x1F
+          print "collision position: $collision_position"
           // If the collision position is 0, then the collision happened at bit 32.
           // See MFRC522 - 9.3.1.15, table 50.
           if collision_position == 0: collision_position = 32
@@ -347,7 +517,7 @@ class Mfrc522:
       if not needs_another_cascade:
         // Temporarily put the PICC into halt.
         hlta := #[0x50, 0x00, 0x00, 0x00]
-        crc := compute_crc_ hlta --to=2
+        crc := compute_crc_ hlta[..2]
         hlta[2] = crc & 0xFF
         hlta[3] = crc >> 8
         transceive_ hlta
@@ -548,7 +718,7 @@ class Mfrc522:
       self_test_data/SelfTestData := it
       if version == self_test_data.version and bytes == self_test_data.bytes: return
 
-    throw "Self test failed; unknown self-test data"
+    throw "Self test failed; unknown self-test data: $version $bytes"
 
 /**
 Firmware data for self-tests.
