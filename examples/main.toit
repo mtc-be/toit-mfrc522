@@ -30,8 +30,8 @@ main:
     iteration++
     catch --trace:
       // print "reading"
-      while data/ByteArray? := reader.is_new_card_present:
-        data = reader.select
+      while reader.is_new_card_present:
+        data := reader.select
         print "--------------- $iteration $data"
 
     reader.antenna_off

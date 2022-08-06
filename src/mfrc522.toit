@@ -153,13 +153,13 @@ class Mfrc522:
 
   See section Iso 14443-3 2008; section 6.2.3.1.
   */
-  transceive_short command/int -> ByteArray?:
+  transceive_short command/int --allow_collision -> ByteArray?:
     if command >= 0x80: throw "INVALID_ARGUMENT"
 
     // Send only 7 bits of the last (only) byte.
     set_framing_ --tx_last_bits=7
 
-    return transceive_ #[command]
+    return transceive_ #[command] --allow_collision=allow_collision
 
   /**
   Transmits a standard frame and returns the response.
@@ -542,98 +542,14 @@ class Mfrc522:
   Leaves one or several PICCs in READY state (from IDLE to READY).
   Still need to do anti-collision or go to ACTIVE state.
   */
-  is_new_card_present -> ByteArray?:
+  is_new_card_present -> bool:
     reset_communication_
-
-    // Cancel any existing command.
-    registers_.write_u8 COMMAND_REGISTER_ COMMAND_IDLE_
-
-    // Clear all irq bits.
-    // The MSB of the register is 0, indicating that all marked bits are cleared.
-    registers_.write_u8 COM_IRQ_REGISTER_ 0x7F
-
-    // Flush the FIFO buffer.
-    // "Immediately clears the internal FIFO buffer's read and write pointer and ErrorReg register's BufferOvfl bit."
-    registers_.write_u8 FIFO_LEVEL_REGISTER_ 0x80
 
     // ISO 14443-3
     PICC_CMD_REQA ::= 0x26
-
-    registers_.write_u8 FIFO_DATA_REGISTER_ PICC_CMD_REQA
-
-    // Check this.
-    // Bit 7: StartSend == 0. (If 1, starts the transmission of data; only valid in
-    //     combination with the Transceive command).
-    // Bit 6-4: RxAlign. Used for reception of bit-oriented frames.
-    //    Usually 0, except for bitwise anticollision at 106bBd.
-    //    0: LSB of the received bit is stored at bit position 0; second at position 1.
-    //    1: LSB of the received bit is stored at bit position 1; second at position 2.
-    //    7: LSB of the received bit is stored at bit position 7; the second received bit is
-    //        stored in the next byte that follows a bit position 0.
-    // Bit 3: reserved for future use.
-    // Bit 2-0: TxLastBits. Used for transmission of bit oriented frames: defines the number of
-    //     bits of the last byte that will be transmitted. 0 indicates that all bits should be transmitted.
-    // The PICC_CMD_REQA should be sent in a "short frame" which has only 7 bits.
-    // Iso-14443-3, 6.4.1. "The REQA and WUPA commands [..] are transmitted within a short frame".
-    registers_.write_u8 BIT_FRAMING_REGISTER_ 0x07
-
-    registers_.write_u8 COMMAND_REGISTER_ COMMAND_TRANSCEIVE_
-
-    // 10.2 General behavior:
-    // """
-    // Each command that needs a data bit stream (or data byte stream) as an input
-    // immediately processes any data in the FIFO buffer.
-    // An exception to this rule is the Transceive command. Using this command, transmission is
-    // started with the BitFramingReg register's StartSend bit.
-    // """
-    // Bit 7: StartSend. Start the transmission of data.
-    registers_.write_u8 BIT_FRAMING_REGISTER_ (registers_.read_u8 BIT_FRAMING_REGISTER_) | 0x80
-
-    completed := false
-    for i := 0; i < 10; i++:
-      irqs := registers_.read_u8 COM_IRQ_REGISTER_
-      // Irq bits:
-      // 7: Set1. When writing defines whether the masked bits should be set or cleared.
-      // 6: TxIRq. Set immediately after the last bit of the transmitted data was sent out.
-      // 5: RxIRq. Receiver has detected the end of a valid data stream. Note: RxModeReg can influence behavior.
-      // 4: IdleIRq. If a command terminates, for example, when the CommandReq changes its value
-      //    from any command to the Idle command. If an unknown command is started.
-      //    The microcontroller starting the Idle command does not set the IdleIRq bit.
-      // 3: HiAlertIRq. Status1Reg has HiAlert bit set.
-      // 2. LoAlertIRq. Status1Reg has LoAlert bit set.
-      // 1. ErrIRq. any error bit in the ErrorReg register is set.
-      // 0. TimerIRq: the timer decrements the timer value in register TCounterValReg to zero.
-
-      // Rx and Idle. (Not sure why idle).
-      if irqs & 0x30 != 0:
-        completed = true
-        break
-      // Timeout. Remember that we automatically start the timeout due to the initialization
-      // in the $on function.
-      if (irqs & 0x01) != 0:
-        throw "TIMEOUT"
-      sleep --ms=3
-    if not completed: return null
-
-    // Read the ATQA (Answer to Request) frame.
-    // ATQA is a standard frame.
-    // 16 bits.
-    // 15-12: RFU
-    // 11-8: Proprietary coding
-    // 7-6: UID size bit frame. Must not be 3 (0b11).
-    //     0 = single
-    //     1 = double
-    //     2 = triple.
-    //     3 = RFU
-    // 5: RFU
-    // 4-0: bit frame anticollision
-    result := ByteArray 2: registers_.read_u8 FIFO_DATA_REGISTER_
-    return result
-
-  // read -> ByteArray?:
-  //   level := registers_.read_u8 FIFO_LEVEL_REGISTER_
-  //   if level == 0: return null
-  //   return ByteArray level: registers_.read_u8 FIFO_DATA_REGISTER_
+    response := transceive_short PICC_CMD_REQA --allow_collision
+    // We don't really care for the response.
+    return response != null
 
   antenna_on:
     current := registers_.read_u8 TX_CONTROL_REGISTER_
