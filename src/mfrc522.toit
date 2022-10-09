@@ -553,7 +553,7 @@ class Mfrc522:
     return (registers_.read_u8 STATUS_2_REGISTER_) & 0x08 != 0
 
   // TODO(florian): add support for key B.
-  authenticate_ --block/int --key/ByteArray --uid/ByteArray:
+  authenticate_ --block/int --key/ByteArray --uid/ByteArray --is_key_a/bool -> bool:
     if uid.size != 4 and uid.size != 7 and uid.size != 10: throw "INVALID_ARGUMENT"
     if key.size != 6: throw "INVALID_ARGUMENT"
 
@@ -561,6 +561,7 @@ class Mfrc522:
     // https://www.nxp.com/docs/en/data-sheet/MF1S50YYX_V1.pdf
     // Section 9.1.
     AUTHENT_KEY_A_COMMAND ::= 0x60
+    AUTHENT_KEY_B_COMMAND ::= 0x61
 
     // Section 10.3.1.9. MFAuthent of MFRC522 datasheet.
     // 12 bytes need to be written into the FIFO:
@@ -569,7 +570,7 @@ class Mfrc522:
     // - 6 sector key bytes.
     // - 4 card serial number bytes.
     bytes := ByteArray 12
-    bytes[0] = AUTHENT_KEY_A_COMMAND
+    bytes[0] = is_key_a ? AUTHENT_KEY_A_COMMAND : AUTHENT_KEY_B_COMMAND
     bytes[1] = block
     bytes.replace 2 key
     // Fill in the last 4 bytes of the UID.
@@ -577,7 +578,8 @@ class Mfrc522:
     // See section 10.1.3 of MIFARE Classic EV1 1K spec.
     bytes.replace 8 uid[uid.size - 4  ..]
 
-    transceive_ --command=COMMAND_MF_AUTHENT_ bytes
+    result := transceive_ --command=COMMAND_MF_AUTHENT_ bytes
+    return result != null
 
   stop_crypto_:
     // Section 9.3.1.9.
@@ -896,6 +898,7 @@ class Card:
     uid.do: uid_str += "$(%02x it)"
     return "UID: $uid_str - $(type_to_str_ type)"
 
+// https://www.nxp.com/docs/en/data-sheet/MF1S50YYX_V1.pdf
 class MifareCard extends Card:
   /** Default key for Mifare cards. */
   static DEFAULT_KEY := #[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
@@ -903,8 +906,8 @@ class MifareCard extends Card:
   constructor transceiver/Mfrc522 uid/ByteArray sak/int:
     super.private_ transceiver uid sak
 
-  authenticate --block/int key/ByteArray=DEFAULT_KEY:
-    return transceiver_.authenticate_ --uid=uid --block=block --key=key
+  authenticate --block/int key/ByteArray=DEFAULT_KEY --is_key_a/bool=true:
+    return transceiver_.authenticate_ --uid=uid --block=block --key=key --is_key_a=is_key_a
 
   is_authenticated -> bool:
     return transceiver_.is_authenticated_
@@ -912,19 +915,35 @@ class MifareCard extends Card:
   read --block/int:
     // TODO(florian): check validity of block.
     MIFARE_READ ::= 0x30
+    // TODO(florian): this is a bad API. Why do we have to reserve the space for the trailing CRC?
     bytes := #[ MIFARE_READ, block, 0x00, 0x00]
     result := transceive bytes --check_crc
     // TODO(florian): cut off CRC?
     return result
 
+  write --block/int bytes/ByteArray:
+    if bytes.size != 16: throw "MifareCard.write: bytes must be 16 bytes long"
+    // TODO(florian): check validity of block.
+    MIFARE_WRITE ::= 0xA0
+    response := transceive #[ MIFARE_WRITE, block, 0x00, 0x00 ] // --check_crc
+    print response
+    // TODO(florian): check status.
+    response = transceive bytes + #[0x00, 0x00] // --check_crc
+    print response
 
   close -> none:
     // Call halt first, before we reset the authentication.
     super
     transceiver_.stop_crypto_
 
+  sectors_count -> int:
+    if type == Card.TYPE_MIFARE_MINI: return 1
+    else if type == Card.TYPE_MIFARE_1K: return 16
+    else if type == Card.TYPE_MIFARE_4K: return 40
+    throw "Unknown card"
+
   dump:
-    no_of_sectors := ?
+    no_of_sectors := sectors_count
     if type == Card.TYPE_MIFARE_MINI: no_of_sectors = 1
     else if type == Card.TYPE_MIFARE_1K: no_of_sectors = 16
     else if type == Card.TYPE_MIFARE_4K: no_of_sectors = 40
