@@ -311,7 +311,9 @@ class Mfrc522:
     // We must not use `read_bytes` for SPI. That doesn't yield the correct result.
     result := ByteArray response_size: registers_.read_u8 FIFO_DATA_REGISTER_
 
-    if check_crc: check_crc_ result
+    if check_crc:
+      check_crc_ result
+      return result[..result.size - 2]
     return result
 
   /**
@@ -460,8 +462,8 @@ class Mfrc522:
     response := transceive_standard_ bytes --check_crc
 
     if not response: throw RfidException.no_response
-    // The SAK must be exactly 3 bytes long.
-    if response.size != 3: throw RfidException.protocol
+    // The SAK must be exactly 1 bytes long (once the CRC has been removed).
+    if response.size != 1: throw RfidException.protocol
     return response
 
   /**
@@ -901,6 +903,7 @@ class Card:
 class MifareCard extends Card:
   static MIFARE_READ_ ::= 0x30
   static MIFARE_WRITE_ ::= 0xA0
+  static ACK_ ::= 0xA0
 
   /** Default key for Mifare cards. */
   static DEFAULT_KEY := #[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
@@ -917,19 +920,16 @@ class MifareCard extends Card:
   read --block/int:
     if not 0 <= block <= total_block_count: throw "INVALID_ARGUMENT"
     bytes := #[ MIFARE_READ_, block]
-    result := transceive bytes --check_crc
-    // TODO(florian): cut off CRC?
-    return result
+    return transceive bytes --check_crc
 
-  write --block/int bytes/ByteArray:
+  write --block/int bytes/ByteArray -> none:
     if not 0 <= block <= total_block_count: throw "INVALID_ARGUMENT"
     if bytes.size != 16: throw "MifareCard.write: bytes must be 16 bytes long"
 
     response := transceive #[ MIFARE_WRITE_, block ]
-    print response
-    // TODO(florian): check status.
-    response = transceive bytes // --check_crc
-    print response
+    if response != ACK_: throw_mifare_error_ response
+    response = transceive bytes
+    if response != ACK_: throw_mifare_error_ response
 
   close -> none:
     // Call halt first, before we reset the authentication.
@@ -957,3 +957,29 @@ class MifareCard extends Card:
 
     // no_of_sectors.repeat:
       // TODO(florian)
+
+  throw_mifare_error_ response/ByteArray:
+    if response.size != 1: throw "Invalid response size"
+    if response[0] == 0x00: throw "Invalid operation"
+    if response[0] == 0x01: throw "Parity or CRC error"
+
+class MifareException:
+  response/ByteArray
+
+  constructor .response/ByteArray:
+
+  is_invalid_response_size: return response.size != 1
+  is_invalid_operation: return code == 0x00 or code == 0x04
+  is_parity_or_crc_error: return code == 0x01 or code == 0x05
+  was_transfer_buffer_valid: return code == 0x00 or code == 0x01
+
+  code -> int:
+    if is_invalid_response_size: return -1
+    return response[0]
+
+  stringify -> string:
+    if is_invalid_response_size: return "Invalid response size"
+    buffer_validity := was_transfer_buffer_valid ? "valid" : "invalid"
+    if is_invalid_operation: return "Invalid operation (transfer buffer $buffer_validity)"
+    if is_parity_or_crc_error: return "Parity or CRC error (transfer buffer $buffer_validity)"
+    return "Unknown error"
