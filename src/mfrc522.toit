@@ -165,14 +165,13 @@ class Mfrc522:
   /**
   Transmits a standard frame and returns the response.
 
-  Automatically fills in the CRC.
+  Automatically adds the CRC.
 
   If $check_crc is true, then automatically checks the crc of the response.
   */
   transceive_standard_ bytes/ByteArray --check_crc/bool=false -> ByteArray?:
-    crc := compute_crc_ bytes[..bytes.size - 2]
-    bytes[bytes.size - 2] = crc & 0xFF
-    bytes[bytes.size - 1] = (crc >> 8) & 0xFF
+    crc := compute_crc_ bytes
+    bytes += #[crc & 0xFF, (crc >> 8) & 0xFF]
 
     // Send all 8 bits of the last (only) byte.
     set_framing_ --tx_last_bits=0
@@ -442,8 +441,8 @@ class Mfrc522:
     // - 4 bytes of UID (potentially the first one being a Cascade Tag, indicating that the UID needs
     //          an additional cascade level).
     // - 1 byte of BCC (Block Check Character).
-    // - 2 bytes of CRC.
-    bytes := ByteArray 9
+    // - 2 bytes of CRC. These will be added by the `transceive_standard_` function.
+    bytes := ByteArray 7
 
     bytes[0] = command
 
@@ -866,7 +865,7 @@ class Card:
   Sends a HLTA ('halt' of type A) command to the card.
   */
   close -> none:
-    hlta := #[0x50, 0x00, 0x00, 0x00]
+    hlta := #[0x50, 0x00]
     // The transceive will wait for a response, timing out.
     // However, that's not a bad thing to do anyway, as we should give the PICC time to
     // go into HALT state.
@@ -900,6 +899,9 @@ class Card:
 
 // https://www.nxp.com/docs/en/data-sheet/MF1S50YYX_V1.pdf
 class MifareCard extends Card:
+  static MIFARE_READ_ ::= 0x30
+  static MIFARE_WRITE_ ::= 0xA0
+
   /** Default key for Mifare cards. */
   static DEFAULT_KEY := #[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
 
@@ -913,22 +915,20 @@ class MifareCard extends Card:
     return transceiver_.is_authenticated_
 
   read --block/int:
-    // TODO(florian): check validity of block.
-    MIFARE_READ ::= 0x30
-    // TODO(florian): this is a bad API. Why do we have to reserve the space for the trailing CRC?
-    bytes := #[ MIFARE_READ, block, 0x00, 0x00]
+    if not 0 <= block <= total_block_count: throw "INVALID_ARGUMENT"
+    bytes := #[ MIFARE_READ_, block]
     result := transceive bytes --check_crc
     // TODO(florian): cut off CRC?
     return result
 
   write --block/int bytes/ByteArray:
+    if not 0 <= block <= total_block_count: throw "INVALID_ARGUMENT"
     if bytes.size != 16: throw "MifareCard.write: bytes must be 16 bytes long"
-    // TODO(florian): check validity of block.
-    MIFARE_WRITE ::= 0xA0
-    response := transceive #[ MIFARE_WRITE, block, 0x00, 0x00 ] // --check_crc
+
+    response := transceive #[ MIFARE_WRITE_, block ]
     print response
     // TODO(florian): check status.
-    response = transceive bytes + #[0x00, 0x00] // --check_crc
+    response = transceive bytes // --check_crc
     print response
 
   close -> none:
@@ -937,9 +937,15 @@ class MifareCard extends Card:
     transceiver_.stop_crypto_
 
   sectors_count -> int:
-    if type == Card.TYPE_MIFARE_MINI: return 1
+    if type == Card.TYPE_MIFARE_MINI: return 5
     else if type == Card.TYPE_MIFARE_1K: return 16
     else if type == Card.TYPE_MIFARE_4K: return 40
+    throw "Unknown card"
+
+  total_block_count -> int:
+    if type == Card.TYPE_MIFARE_MINI: return 5 * 4
+    else if type == Card.TYPE_MIFARE_1K: return 16 * 4
+    else if type == Card.TYPE_MIFARE_4K: return 32 * 4 + 8 * 16
     throw "Unknown card"
 
   dump:
