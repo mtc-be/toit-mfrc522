@@ -901,9 +901,16 @@ class Card:
 
 // https://www.nxp.com/docs/en/data-sheet/MF1S50YYX_V1.pdf
 class MifareCard extends Card:
+  /**
+  The first block of a Mifare card contains the manufacturer data.
+  It is generally read-only (except for "magic" cards), and contains:
+  -
+  */
+  static MANUFACTURER_BLOCK ::= 0
+
   static MIFARE_READ_ ::= 0x30
   static MIFARE_WRITE_ ::= 0xA0
-  static ACK_ ::= 0xA0
+  static ACK_ ::= #[0x0A]
 
   /** Default key for Mifare cards. */
   static DEFAULT_KEY := #[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
@@ -922,9 +929,16 @@ class MifareCard extends Card:
     bytes := #[ MIFARE_READ_, block]
     return transceive bytes --check_crc
 
-  write --block/int bytes/ByteArray -> none:
+  /**
+  Writes $bytes to a given block.
+
+  Checks that the data is valid for block 0 (the UUID), and the sector trailers.
+  if $force is true, writes the data, even if they don't pass the validity check.
+  */
+  write --block/int bytes/ByteArray --force/bool=false -> none:
     if not 0 <= block <= total_block_count: throw "INVALID_ARGUMENT"
     if bytes.size != 16: throw "MifareCard.write: bytes must be 16 bytes long"
+    if block == MANUFACTURER_BLOCK and not force: check_manufacturer_data_ bytes
 
     response := transceive #[ MIFARE_WRITE_, block ]
     if response != ACK_: throw (MifareException.from_response_ response)
@@ -964,8 +978,29 @@ class MifareCard extends Card:
     if response[0] == 0x00: throw "Invalid operation"
     if response[0] == 0x01: throw "Parity or CRC error"
 
+  check_manufacturer_data_ bytes/ByteArray:
+    // 7byte test: 041799F2DA61 80884400C82000000000
+
+    // We assume that the UID must be of the same size as the current UID.
+    // Magic cards generally don't allow to switch UID size.
+    new_uid_bytes := bytes[..uid.size]
+    bcc := 0
+    new_uid_bytes.do: bcc ^= it
+    if bcc != bytes[uid.size]: throw (MifareException.code_ MifareException.INVALID_UID_BCC)
+
+
 class MifareException:
-  static INVALID_RESPONSE_SIZE ::= -1
+  /**
+  The card did not return an ACK, but the response did not match any known error code
+    or format.
+  */
+  static INVALID_ERROR_RESPONSE ::= -1
+  /**
+  When writing the manufacturer block, the BCC (block check character) was found to be
+    invalid.
+  A BCC is a checksum over the UID bytes, and an invalid BCC can brick magic cards.
+  */
+  static INVALID_UID_BCC ::= -2
   static INVALID_OPERATION_VALID_BUFFER ::= 0x00
   static PARITY_OR_CRC_ERROR_VALID_BUFFER ::= 0x01
   static INVALID_OPERATION_INVALID_BUFFER ::= 0x04
@@ -974,26 +1009,30 @@ class MifareException:
   /** The received data, if any. */
   response/ByteArray?
 
-  constructor.from_response_ .response/ByteArray:
-
-  is_invalid_response_size: return response.size != 1
-  is_invalid_operation: return code == INVALID_OPERATION_VALID_BUFFER or code == INVALID_OPERATION_INVALID_BUFFER
-  is_parity_or_crc_error: return code == PARITY_OR_CRC_ERROR_VALID_BUFFER or code == PARITY_OR_CRC_ERROR_INVALID_BUFFER
-  was_transfer_buffer_valid: return code == INVALID_OPERATION_VALID_BUFFER or code == PARITY_OR_CRC_ERROR_VALID_BUFFER
-
   /**
   The code of the error.
 
   Codes $INVALID_OPERATION_VALID_BUFFER, $PARITY_OR_CRC_ERROR_VALID_BUFFER, $INVALID_OPERATION_INVALID_BUFFER and
     $PARITY_OR_CRC_ERROR_INVALID_BUFFER are responses from the Mifare card. Other codes are defined by this library.
   */
-  code -> int:
-    if is_invalid_response_size: return -1
-    return response[0]
+  code/int
+
+  constructor.from_response_ .response/ByteArray:
+    if response.size != 1: code = INVALID_ERROR_RESPONSE
+    if response[0] != INVALID_OPERATION_VALID_BUFFER and response[0] != PARITY_OR_CRC_ERROR_VALID_BUFFER and
+        response[0] != INVALID_OPERATION_INVALID_BUFFER and response[0] != PARITY_OR_CRC_ERROR_INVALID_BUFFER:
+      code = INVALID_ERROR_RESPONSE
+    else:
+      code = response[0]
+
+  constructor.code_ .code:
+    response = null
 
   stringify -> string:
-    if is_invalid_response_size: return "Invalid response size"
-    buffer_validity := was_transfer_buffer_valid ? "valid" : "invalid"
-    if is_invalid_operation: return "Invalid operation (transfer buffer $buffer_validity)"
-    if is_parity_or_crc_error: return "Parity or CRC error (transfer buffer $buffer_validity)"
-    return "Unknown error"
+    if code == INVALID_ERROR_RESPONSE: return "Invalid response: $response"
+    if code == INVALID_UID_BCC: return "Invalid UID BCC"
+    if code == INVALID_OPERATION_VALID_BUFFER: return "Invalid operation (valid buffer)"
+    if code == PARITY_OR_CRC_ERROR_VALID_BUFFER: return "Parity or CRC error (valid buffer)"
+    if code == INVALID_OPERATION_INVALID_BUFFER: return "Invalid operation (invalid buffer)"
+    if code == PARITY_OR_CRC_ERROR_INVALID_BUFFER: return "Parity or CRC error (invalid buffer)"
+    return "Unknown error code: $code"
