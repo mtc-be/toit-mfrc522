@@ -927,9 +927,9 @@ class MifareCard extends Card:
     if bytes.size != 16: throw "MifareCard.write: bytes must be 16 bytes long"
 
     response := transceive #[ MIFARE_WRITE_, block ]
-    if response != ACK_: throw_mifare_error_ response
+    if response != ACK_: throw (MifareException.from_response_ response)
     response = transceive bytes
-    if response != ACK_: throw_mifare_error_ response
+    if response != ACK_: throw (MifareException.from_response_ response)
 
   close -> none:
     // Call halt first, before we reset the authentication.
@@ -959,20 +959,34 @@ class MifareCard extends Card:
       // TODO(florian)
 
   throw_mifare_error_ response/ByteArray:
+
     if response.size != 1: throw "Invalid response size"
     if response[0] == 0x00: throw "Invalid operation"
     if response[0] == 0x01: throw "Parity or CRC error"
 
 class MifareException:
-  response/ByteArray
+  static INVALID_RESPONSE_SIZE ::= -1
+  static INVALID_OPERATION_VALID_BUFFER ::= 0x00
+  static PARITY_OR_CRC_ERROR_VALID_BUFFER ::= 0x01
+  static INVALID_OPERATION_INVALID_BUFFER ::= 0x04
+  static PARITY_OR_CRC_ERROR_INVALID_BUFFER ::= 0x05
 
-  constructor .response/ByteArray:
+  /** The received data, if any. */
+  response/ByteArray?
+
+  constructor.from_response_ .response/ByteArray:
 
   is_invalid_response_size: return response.size != 1
-  is_invalid_operation: return code == 0x00 or code == 0x04
-  is_parity_or_crc_error: return code == 0x01 or code == 0x05
-  was_transfer_buffer_valid: return code == 0x00 or code == 0x01
+  is_invalid_operation: return code == INVALID_OPERATION_VALID_BUFFER or code == INVALID_OPERATION_INVALID_BUFFER
+  is_parity_or_crc_error: return code == PARITY_OR_CRC_ERROR_VALID_BUFFER or code == PARITY_OR_CRC_ERROR_INVALID_BUFFER
+  was_transfer_buffer_valid: return code == INVALID_OPERATION_VALID_BUFFER or code == PARITY_OR_CRC_ERROR_VALID_BUFFER
 
+  /**
+  The code of the error.
+
+  Codes $INVALID_OPERATION_VALID_BUFFER, $PARITY_OR_CRC_ERROR_VALID_BUFFER, $INVALID_OPERATION_INVALID_BUFFER and
+    $PARITY_OR_CRC_ERROR_INVALID_BUFFER are responses from the Mifare card. Other codes are defined by this library.
+  */
   code -> int:
     if is_invalid_response_size: return -1
     return response[0]
