@@ -22,6 +22,31 @@ Idraetscentre:
 sector 4-14: a: 3E65E4FB65B3
 */
 
+REJSEKORT_UID ::= #[ 0x2b, 0x53, 0x23, 0x83 ]
+REJESKORT_KEYS ::= (::
+  key1 := #[ 0xfc, 0x00, 0x01, 0x87,0x78,0xf7]
+  key2 := #[ 0x02, 0x97, 0x92, 0x7c,0x0f,0x77]
+  key3 := #[ 0x72, 0x2b, 0xfc, 0xc5,0x37,0x5f]
+  key4 := #[ 0xfc, 0x00, 0x01, 0x87,0x78,0xf7]
+
+  keys := []
+  8.repeat: keys.add key1
+  5.repeat: keys.add key2
+  26.repeat: keys.add key3
+  keys.add key4
+  keys
+).call
+
+IDRAET_UID ::= #[ 0x04, 0x17, 0x99, 0xf2, 0xda, 0x61, 0x80 ]
+IDRAET_KEYS ::= (::
+  key1 := #[ 0x3e, 0x65, 0xe4, 0xfb,0x65,0xb3]
+  keys := []
+  4.repeat: keys.add mfrc522.MifareCard.DEFAULT_KEY
+  11.repeat: keys.add key1
+  keys.add mfrc522.MifareCard.DEFAULT_KEY
+  keys
+).call
+
 main:
   bus := spi.Bus
       --clock = gpio.Pin SPI_CLK
@@ -51,67 +76,51 @@ main:
           if it is mfrc522.MifareCard:
             mifare := it as mfrc522.MifareCard
 
-            // TODO(florian): figure out how we can authenticate
-            // again after we used a bad password.
-            for i := 63; i >= 0; i--:
-              is_first_block_in_sector := (i + 1) % 4 == 0
-              if is_first_block_in_sector:
-                mifare.authenticate --block=i
-              if not mifare.is_authenticated:
-                print "Block $i encrypted"
-                mifare.transceiver_.stop_crypto_
-                continue
-              block_data := mifare.read --block=i
-              is_trailer_block := (i + 1) % 4 == 0
-              trailer_suffix := ""
-              if is_trailer_block:
-                c1 := block_data[7] >> 4
-                c2 := block_data[8] & 0xf
-                c3 := block_data[8] >> 4
-                c1_ := block_data[6] & 0xf
-                c2_ := block_data[6] >> 4
-                c3_ := block_data[7] & 0xf
+            // dump := mifare.dump
+            // List.chunk_up 0 dump.size 16: | from to |
+            //   print dump[from..to]
 
-                // cX_ should always be the inverted version of cX.
-                if c1_ != 0xf - c1 or c2_ != 0xf - c2 or c3_ != 0xf - c3:
-                  trailer_suffix = "(invalid checksum)"
-                else:
-                  b0 := (c1 & 0b0001) << 2 | (c2 & 0b0001) << 1 | (c3 & 0b0001) << 0
-                  b1 := (c1 & 0b0010) << 1 | (c2 & 0b0010) << 0 | (c3 & 0b0010) >> 1
-                  b2 := (c1 & 0b0100) << 0 | (c2 & 0b0100) >> 1 | (c3 & 0b0100) >> 2
-                  b3 := (c1 & 0b1000) >> 1 | (c2 & 0b1000) >> 2 | (c3 & 0b1000) >> 3
-                  /*
-                  Access bits.
-                  For the trailer:
-                            Key A, Access bits, Key B
-                    0b000: Aw   ,  Ar        , Arw      # Key B is readable.
-                    0b010:      ,  Ar        , Ar       # Key B is readable.
-                    0b100:    Bw,  Ar  Br    ,     Bw
-                    0b110:      ,  Ar  Br    ,
-                    0b001: Aw   ,  Arw       , Arw      # Transport configuration. Key B is readable.
-                    0b011:    Bw,  Ar  Brw   ,     Bw
-                    0b101:      ,  Ar  Brw   ,
-                    0b111:      ,  Ar  Br    ,
+            keys := null
+            if mifare.uid == REJSEKORT_UID:
+              keys = REJESKORT_KEYS
+            else if mifare.uid == IDRAET_UID:
+              keys = IDRAET_KEYS
 
-                  For the data blocks:
-                            read write increment decrement/transfer/restore
-                    0b000:   AB   AB      AB       AB    # Transport configuration
-                    0b010:   AB   --      --       --    # read/write block
-                    0b100:   AB    B      --       --    # read/write block
-                    0b110:   AB    B       B       AB    # value block
-                    0b001:   AB   --      --       AB    # value block
-                    0b011:    B    B      --       --    # read/write block
-                    0b101:    B   --      --       --    # read/write block
-                    0b111:   --   --      --       --    # read/write block
-                  */
-                  trailer_suffix = " (access bits: $(%x b0) $(%x b1) $(%x b2) $(%x b3))"
-              print "$block_data$trailer_suffix"
+            mifare.write_to_stdout --keys=keys
 
-            if mifare.uid == #[0x13, 0x59, 0x70, 0x15]:
-              print "writing to block 2 of sector 1"
-              mifare.authenticate --block=5
-              print "old: $(mifare.read --block=5)"
-              mifare.write --block=5 #[ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f ]
+            // key1 := #[ 0x3e, 0x65, 0xe4, 0xfb,0x65,0xb3]
+            // keys := []
+            // 5.repeat: keys.add mfrc522.MifareCard.DEFAULT_KEY
+            // 11.repeat: keys.add key1
+            // keys.add mfrc522.MifareCard.DEFAULT_KEY
+            // mifare.write_to_stdout --keys=keys
+
+            // for i := 63; i >= 0; i--:
+            //   is_first_block_in_sector := (i + 1) % 4 == 0
+            //   if is_first_block_in_sector:
+            //     mifare.authenticate --block=i
+            //   if not mifare.is_authenticated:
+            //     print "Block $i encrypted"
+            //     mifare.transceiver_.stop_crypto_
+            //     continue
+            //   block_data := mifare.read --block=i
+            //   is_trailer_block := (i + 1) % 4 == 0
+            //   trailer_suffix := ""
+            //   access_bits := null
+            //   if is_trailer_block:
+            //     exception := catch: access_bits = mifare.access_bits_from_trailer block_data
+            //     if exception:
+            //       trailer_suffix = " (invalid access_bits)"
+            //     else:
+            //       trailer_suffix = " (access bits: $(%x access_bits[0]) $(%x access_bits[1]) $(%x access_bits[2]) $(%x access_bits[3]))"
+
+            //   print "$block_data$trailer_suffix"
+
+            // if mifare.uid == #[0x13, 0x59, 0x70, 0x15]:
+            //   print "writing to block 2 of sector 1"
+            //   mifare.authenticate --block=5
+            //   print "old: $(mifare.read --block=5)"
+            //   mifare.write --block=5 #[ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f ]
 
     reader.antenna_off
     sleep --ms=2_000

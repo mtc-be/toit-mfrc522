@@ -588,6 +588,23 @@ class Mfrc522:
     old := registers_.read_u8 STATUS_2_REGISTER_
     registers_.write_u8 STATUS_2_REGISTER_ (old & ~0x08)
 
+  wake_up_cards_ --only_new/bool=false -> ByteArray?:
+    reset_communication_
+
+    // Wake up the given PICC.
+    // ISO 14443-3
+    CMD_WUPA ::= 0x52
+    // Wake up new cards.
+    // The CMD_REQA should be sent in a "short frame" which has only 7 bits.
+    // Iso-14443-3, 6.4.1. "The REQA and WUPA commands [..] are transmitted within a short frame".
+    CMD_REQA ::= 0x26
+
+    command := only_new ? CMD_REQA : CMD_WUPA
+
+    // The CMD_REQA/CMD_WUPA should be sent in a "short frame" which has only 7 bits.
+    // Iso-14443-3, 6.4.1. "The REQA and WUPA commands [..] are transmitted within a short frame".
+    return transceive_short_ command --allow_collision
+
   /**
   Wakes up all new PICCs and executes the given $block for each.
 
@@ -597,13 +614,7 @@ class Mfrc522:
     if not new: throw "INVALID_ARGUMENT"
 
     while true:
-      reset_communication_
-      // Wake up new cards.
-      // The CMD_REQA should be sent in a "short frame" which has only 7 bits.
-      // Iso-14443-3, 6.4.1. "The REQA and WUPA commands [..] are transmitted within a short frame".
-      CMD_REQA ::= 0x26
-      // We don't really care for the response.
-      if (transceive_short_ CMD_REQA --allow_collision) == null: return
+      if not wake_up_cards_ --only_new: return
       card := select_
       try:
         block.call card
@@ -616,15 +627,7 @@ class Mfrc522:
   The $block is called with the $Card as argument.
   */
   with_picc uid/ByteArray [block] -> none:
-    reset_communication_
-    // Wake up the given PICC.
-    // ISO 14443-3
-    CMD_WUPA ::= 0x52
-    // The CMD_WUPA should be sent in a "short frame" which has only 7 bits.
-    // Iso-14443-3, 6.4.1. "The REQA and WUPA commands [..] are transmitted within a short frame".
-    if (transceive_short_ CMD_WUPA --allow_collision) == null:
-      // We don't really care for the content of the response.
-      return
+    if not wake_up_cards_: return
     card := select_ uid
     try:
       block.call card
@@ -863,15 +866,18 @@ class Card:
   transceive bytes/ByteArray --check_crc/bool=false -> ByteArray?:
     return transceiver_.transceive_standard_ bytes --check_crc=check_crc
 
-  /**
-  Sends a HLTA ('halt' of type A) command to the card.
-  */
-  close -> none:
+  halt_ -> none:
     hlta := #[0x50, 0x00]
     // The transceive will wait for a response, timing out.
     // However, that's not a bad thing to do anyway, as we should give the PICC time to
     // go into HALT state.
     transceiver_.transceive_standard_ hlta
+
+  /**
+  Sends a HLTA ('halt' of type A) command to the card.
+  */
+  close -> none:
+    halt_
 
   static sak_to_type_ sak/int uid/ByteArray -> int:
     // See NXP AN 10833 - MIFARE Type ID Procedure.
@@ -932,45 +938,234 @@ class MifareCard extends Card:
   /**
   Writes $bytes to a given block.
 
-  Checks that the data is valid for block 0 (the UUID), and the sector trailers.
-  if $force is true, writes the data, even if they don't pass the validity check.
+  Checks that the data is valid for block 0 (the UUID), that the sector trailer's access
+    bits are correct, and that they don't lock out the user from modifying the access
+    bits in the future.
+  If $force is true, writes the data, without doing any check.
+  If $force_lockout is true, verifies that the data is correct, but allows to
+    lock out the user from modifying the access bits in the future. The parameter
+    $force implies $force_lockout.
   */
-  write --block/int bytes/ByteArray --force/bool=false -> none:
+  write --block/int bytes/ByteArray --force/bool=false --force_lockout/bool=false -> none:
     if not 0 <= block <= total_block_count: throw "INVALID_ARGUMENT"
     if bytes.size != 16: throw "MifareCard.write: bytes must be 16 bytes long"
     if block == MANUFACTURER_BLOCK and not force: check_manufacturer_data_ bytes
+    if is_trailer_block block and not force: check_trailer_data_ bytes --allow_lockout=(not force_lockout)
 
     response := transceive #[ MIFARE_WRITE_, block ]
-    if response != ACK_: throw (MifareException.from_response_ response)
+    if response != ACK_: throw (MifareException.from_response response)
     response = transceive bytes
-    if response != ACK_: throw (MifareException.from_response_ response)
+    if response != ACK_: throw (MifareException.from_response response)
 
   close -> none:
     // Call halt first, before we reset the authentication.
     super
     transceiver_.stop_crypto_
 
+  is_trailer_block block/int:
+    if block < (32 * 4):
+      return block % 4 == 3
+    return block % 16 == 15
+
+  is_first_block_in_sector block/int:
+    if block < (32 * 4):
+      return block % 4 == 0
+    return block % 16 == 0
+
   sectors_count -> int:
-    if type == Card.TYPE_MIFARE_MINI: return 5
-    else if type == Card.TYPE_MIFARE_1K: return 16
-    else if type == Card.TYPE_MIFARE_4K: return 40
+    if type == Card.TYPE_MIFARE_MINI:
+      return 5
+    else if type == Card.TYPE_MIFARE_1K or type == Card.TYPE_MIFARE_PLUS_DESFIRE:
+      return 16
+    else if type == Card.TYPE_MIFARE_4K:
+      return 40
     throw "Unknown card"
 
   total_block_count -> int:
-    if type == Card.TYPE_MIFARE_MINI: return 5 * 4
-    else if type == Card.TYPE_MIFARE_1K: return 16 * 4
-    else if type == Card.TYPE_MIFARE_4K: return 32 * 4 + 8 * 16
-    throw "Unknown card"
+    sectors := sectors_count
+    if sectors <= 32: return sectors * 4
+    return 32 * 4 + (sectors - 32) * 16
 
-  dump:
-    no_of_sectors := sectors_count
-    if type == Card.TYPE_MIFARE_MINI: no_of_sectors = 1
-    else if type == Card.TYPE_MIFARE_1K: no_of_sectors = 16
-    else if type == Card.TYPE_MIFARE_4K: no_of_sectors = 40
-    else: unreachable
+  /**
+  The size of the given block in blocks.
+  */
+  sector_size_in_blocks sector/int -> int:
+    if sector < 32: return 4
+    return 16
 
-    // no_of_sectors.repeat:
-      // TODO(florian)
+  /**
+  Extracts the access bits from the trailer block.
+
+  The returned list contains 4 integers, each between 0 and 7.
+  The first three integers provide the access bits for the data blocks.
+  The list integer provides the access bits for the trailer block itself.
+
+  When a sector has more than 3 data blocks (Mifare 4K), then the access bits are
+    applied as follows:
+    * b0 (the first byte), applies to blocks 0-4
+    * b1 (the second byte), applies to blocks 5-9
+    * b2 (the third byte), applies to blocks 10-14
+
+  The meaning of the access bits for data blocks is as follows:
+  ```
+          read write increment decrement/transfer/restore
+  0b000:   AB   AB      AB       AB    # Transport configuration
+  0b010:   AB   --      --       --    # read/write block
+  0b100:   AB    B      --       --    # read/write block
+  0b110:   AB    B       B       AB    # value block
+  0b001:   AB   --      --       AB    # value block
+  0b011:    B    B      --       --    # read/write block
+  0b101:    B   --      --       --    # read/write block
+  0b111:   --   --      --       --    # read/write block
+  ```
+
+  The meaning of the access bits for the trailer block is as follows.
+  ```
+          Key A, Access bits, Key B
+  0b000: Aw   ,  Ar        , Arw      # Key B is readable.
+  0b010:      ,  Ar        , Ar       # Key B is readable.
+  0b100:    Bw,  Ar  Br    ,     Bw
+  0b110:      ,  Ar  Br    ,
+  0b001: Aw   ,  Arw       , Arw      # Transport configuration. Key B is readable.
+  0b011:    Bw,  Ar  Brw   ,     Bw
+  0b101:      ,  Ar  Brw   ,
+  0b111:      ,  Ar  Br    ,
+  ```
+  */
+  static access_bits_from_trailer bytes/ByteArray -> List:
+    if bytes.size != 16: throw "MifareCard.access_bits_from_trailer: bytes must be 16 bytes long"
+    c1 := bytes[7] >> 4
+    c2 := bytes[8] & 0xf
+    c3 := bytes[8] >> 4
+    c1_ := bytes[6] & 0xf
+    c2_ := bytes[6] >> 4
+    c3_ := bytes[7] & 0xf
+
+    // cX_ should always be the inverted version of cX.
+    if c1_ != 0xf - c1 or c2_ != 0xf - c2 or c3_ != 0xf - c3:
+      throw (MifareException.from_code MifareException.INVALID_ACCESS_BITS)
+    else:
+      b0 := (c1 & 0b0001) << 2 | (c2 & 0b0001) << 1 | (c3 & 0b0001) << 0
+      b1 := (c1 & 0b0010) << 1 | (c2 & 0b0010) << 0 | (c3 & 0b0010) >> 1
+      b2 := (c1 & 0b0100) << 0 | (c2 & 0b0100) >> 1 | (c3 & 0b0100) >> 2
+      b3 := (c1 & 0b1000) >> 1 | (c2 & 0b1000) >> 2 | (c3 & 0b1000) >> 3
+      return [b0, b1, b2, b3]
+
+  check_keys_ keys/List:
+    keys.do:
+      if it.size != 6: throw "Keys must be 6 bytes long"
+
+  dump --keys/List=(List sectors_count: DEFAULT_KEY) -> ByteArray:
+    check_keys_ keys
+    result := ByteArray total_block_count * 16
+    sector_counter := 0
+    key/ByteArray? := null
+    for i := 0; i < total_block_count; i++:
+      if is_first_block_in_sector i:
+        // Set the key so we can update the trailer block later.
+        key = keys[sector_counter]
+        authenticated := authenticate --block=i key
+        if not authenticated: throw (MifareException.from_code MifareException.AUTHENTICATION_FAILED)
+        sector_counter++
+      block_bytes := read --block=i
+      if is_trailer_block i: block_bytes.replace 0 key
+      result.replace (i * 16) block_bytes
+    return result
+
+  static data_access_bits_to_string bits/int -> string:
+    if bits == 0b000:
+      return "000 - read:AB, write:AB, increment:AB, decrement:AB"
+    if bits == 0b010:
+      return "010 - read:AB"
+    if bits == 0b100:
+      return "100 - read:AB, write:B"
+    if bits == 0b110:
+      return "110 - read:AB, write:B, increment:B, decrement:AB"
+    if bits == 0b001:
+      return "001 - read:AB, decrement:AB"
+    if bits == 0b011:
+      return "011 - read:B, write:B"
+    if bits == 0b101:
+      return "101 - read:B"
+    if bits == 0b111:
+      return "111 - no access"
+    unreachable
+
+  static trailer_access_bits_to_string bits/int -> string:
+    if bits == 0b000:
+      return "000 - Key A: Aw, Bits: Ar, Key B: Arw"
+    if bits == 0b010:
+      return "010 - Bits: Ar, Key B: Ar"
+    if bits == 0b100:
+      return "100 - Key A: Bw, Bits: Ar Br,  Key B: Bw"
+    if bits == 0b110:
+      return "110 - Bits: Ar Br"
+    if bits == 0b001:
+      return "001 - Key A: Aw, Bits: Arw, Key B: Arw"
+    if bits == 0b011:
+      return "011 - Key A: Bw, Bits: Ar Brw, Key B: Bw"
+    if bits == 0b101:
+      return "101 - Bits: Ar Brw"
+    if bits == 0b111:
+      return "111 - Bits: Ar Br"
+    unreachable
+
+  /**
+  Dumps the content of the card to stdout.
+
+  If there is an authentication error automatically reconnects. This might wake up other
+    cards that are in the field.
+  */
+  write_to_stdout --keys/List=(List sectors_count: DEFAULT_KEY) --print_last_first/bool=true:
+    check_keys_ keys
+    result := ByteArray total_block_count * 16
+    sector_counter := 0
+    key/ByteArray? := null
+    block := 0
+    while block < total_block_count:
+      if is_first_block_in_sector block:
+        if block != 0: print
+        print "Sector $sector_counter:"
+        // Set the key so we can update the trailer block later.
+        key = keys[sector_counter]
+        authenticated := authenticate --block=block key
+        if not authenticated:
+          print "  encrypted"
+          reset_communication_
+          // Skip over the remaining blocks in this sector.
+          block += sector_size_in_blocks sector_counter
+          sector_counter++
+          continue
+
+      blocks := []
+      sector_size := sector_size_in_blocks sector_counter
+      for j := 0; j < sector_size; j++:
+        block_bytes := read --block=block
+        if is_trailer_block block: block_bytes.replace 0 key
+        blocks.add block_bytes
+        block++
+
+      access_bits := access_bits_from_trailer blocks.last
+      for i := 0; i < blocks.size; i++:
+        block_bytes := blocks[i]
+        block_str := ""
+        block_bytes.do: block_str += "$(%02x it)"
+        access_bits_for_block := ?
+        if sector_size == 4:
+          access_bits_for_block = access_bits[i]
+        else
+          if i < 5: access_bits_for_block = access_bits[0]
+          else if i < 10: access_bits_for_block = access_bits[1]
+          else if i < 15: access_bits_for_block = access_bits[2]
+          else: access_bits_for_block = access_bits[3]
+
+        legend := ?
+        if i != blocks.size - 1: legend = data_access_bits_to_string access_bits_for_block
+        else: legend = trailer_access_bits_to_string access_bits_for_block
+
+        print "  $block_str ($legend)"
+
+      sector_counter++
 
   throw_mifare_error_ response/ByteArray:
 
@@ -979,17 +1174,28 @@ class MifareCard extends Card:
     if response[0] == 0x01: throw "Parity or CRC error"
 
   check_manufacturer_data_ bytes/ByteArray:
-    // 7byte test: 041799F2DA61 80884400C82000000000
-
     // We assume that the UID must be of the same size as the current UID.
     // Magic cards generally don't allow to switch UID size.
     new_uid_bytes := bytes[..uid.size]
     bcc := 0
     new_uid_bytes.do: bcc ^= it
-    if bcc != bytes[uid.size]: throw (MifareException.code_ MifareException.INVALID_UID_BCC)
+    if bcc != bytes[uid.size]: throw (MifareException.from_code MifareException.INVALID_UID_BCC)
+
+  check_trailer_data_ byte/ByteArray --allow_lockout/bool:
+
+  reset_communication_:
+    transceiver_.stop_crypto_
+    halt_
+    transceiver_.wake_up_cards_
+    transceiver_.select_ uid
 
 
 class MifareException:
+  static INVALID_OPERATION_VALID_BUFFER ::= 0x00
+  static PARITY_OR_CRC_ERROR_VALID_BUFFER ::= 0x01
+  static INVALID_OPERATION_INVALID_BUFFER ::= 0x04
+  static PARITY_OR_CRC_ERROR_INVALID_BUFFER ::= 0x05
+
   /**
   The card did not return an ACK, but the response did not match any known error code
     or format.
@@ -1001,10 +1207,16 @@ class MifareException:
   A BCC is a checksum over the UID bytes, and an invalid BCC can brick magic cards.
   */
   static INVALID_UID_BCC ::= -2
-  static INVALID_OPERATION_VALID_BUFFER ::= 0x00
-  static PARITY_OR_CRC_ERROR_VALID_BUFFER ::= 0x01
-  static INVALID_OPERATION_INVALID_BUFFER ::= 0x04
-  static PARITY_OR_CRC_ERROR_INVALID_BUFFER ::= 0x05
+  /**
+  The access bits of a trailer block are duplicated in such a way that each bit has
+    a corresponding inverted bit. This error is used when that's not the case.
+  */
+  static INVALID_ACCESS_BITS ::= -3
+
+  /**
+  The Mifare authentication failed.
+  */
+  static AUTHENTICATION_FAILED ::= -4
 
   /** The received data, if any. */
   response/ByteArray?
@@ -1017,7 +1229,7 @@ class MifareException:
   */
   code/int
 
-  constructor.from_response_ .response/ByteArray:
+  constructor.from_response .response/ByteArray:
     if response.size != 1: code = INVALID_ERROR_RESPONSE
     if response[0] != INVALID_OPERATION_VALID_BUFFER and response[0] != PARITY_OR_CRC_ERROR_VALID_BUFFER and
         response[0] != INVALID_OPERATION_INVALID_BUFFER and response[0] != PARITY_OR_CRC_ERROR_INVALID_BUFFER:
@@ -1025,14 +1237,16 @@ class MifareException:
     else:
       code = response[0]
 
-  constructor.code_ .code:
+  constructor.from_code .code:
     response = null
 
   stringify -> string:
-    if code == INVALID_ERROR_RESPONSE: return "Invalid response: $response"
-    if code == INVALID_UID_BCC: return "Invalid UID BCC"
     if code == INVALID_OPERATION_VALID_BUFFER: return "Invalid operation (valid buffer)"
     if code == PARITY_OR_CRC_ERROR_VALID_BUFFER: return "Parity or CRC error (valid buffer)"
     if code == INVALID_OPERATION_INVALID_BUFFER: return "Invalid operation (invalid buffer)"
     if code == PARITY_OR_CRC_ERROR_INVALID_BUFFER: return "Parity or CRC error (invalid buffer)"
+    if code == INVALID_ERROR_RESPONSE: return "Invalid response: $response"
+    if code == INVALID_UID_BCC: return "Invalid UID BCC"
+    if code == INVALID_ACCESS_BITS: return "Invalid access bits"
+    if code == AUTHENTICATION_FAILED: return "Authentication failed"
     return "Unknown error code: $code"
