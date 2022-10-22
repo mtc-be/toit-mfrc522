@@ -945,6 +945,8 @@ class MifareCard extends Card:
   If $force_lockout is true, verifies that the data is correct, but allows to
     lock out the user from modifying the access bits in the future. The parameter
     $force implies $force_lockout.
+  The $force and $force_lockout flags only verify the data in the $bytes array. They
+    don't check that the user is allowed to write to the block.
   */
   write --block/int bytes/ByteArray --force/bool=false --force_lockout/bool=false -> none:
     if not 0 <= block <= total_block_count: throw "INVALID_ARGUMENT"
@@ -993,64 +995,6 @@ class MifareCard extends Card:
     if sector < 32: return 4
     return 16
 
-  /**
-  Extracts the access bits from the trailer block.
-
-  The returned list contains 4 integers, each between 0 and 7.
-  The first three integers provide the access bits for the data blocks.
-  The list integer provides the access bits for the trailer block itself.
-
-  When a sector has more than 3 data blocks (Mifare 4K), then the access bits are
-    applied as follows:
-    * b0 (the first byte), applies to blocks 0-4
-    * b1 (the second byte), applies to blocks 5-9
-    * b2 (the third byte), applies to blocks 10-14
-
-  The meaning of the access bits for data blocks is as follows:
-  ```
-          read write increment decrement/transfer/restore
-  0b000:   AB   AB      AB       AB    # Transport configuration
-  0b010:   AB   --      --       --    # read/write block
-  0b100:   AB    B      --       --    # read/write block
-  0b110:   AB    B       B       AB    # value block
-  0b001:   AB   --      --       AB    # value block
-  0b011:    B    B      --       --    # read/write block
-  0b101:    B   --      --       --    # read/write block
-  0b111:   --   --      --       --    # read/write block
-  ```
-
-  The meaning of the access bits for the trailer block is as follows.
-  ```
-          Key A, Access bits, Key B
-  0b000: Aw   ,  Ar        , Arw      # Key B is readable.
-  0b010:      ,  Ar        , Ar       # Key B is readable.
-  0b100:    Bw,  Ar  Br    ,     Bw
-  0b110:      ,  Ar  Br    ,
-  0b001: Aw   ,  Arw       , Arw      # Transport configuration. Key B is readable.
-  0b011:    Bw,  Ar  Brw   ,     Bw
-  0b101:      ,  Ar  Brw   ,
-  0b111:      ,  Ar  Br    ,
-  ```
-  */
-  static access_bits_from_trailer bytes/ByteArray -> List:
-    if bytes.size != 16: throw "MifareCard.access_bits_from_trailer: bytes must be 16 bytes long"
-    c1 := bytes[7] >> 4
-    c2 := bytes[8] & 0xf
-    c3 := bytes[8] >> 4
-    c1_ := bytes[6] & 0xf
-    c2_ := bytes[6] >> 4
-    c3_ := bytes[7] & 0xf
-
-    // cX_ should always be the inverted version of cX.
-    if c1_ != 0xf - c1 or c2_ != 0xf - c2 or c3_ != 0xf - c3:
-      throw (MifareException.from_code MifareException.INVALID_ACCESS_BITS)
-    else:
-      b0 := (c1 & 0b0001) << 2 | (c2 & 0b0001) << 1 | (c3 & 0b0001) << 0
-      b1 := (c1 & 0b0010) << 1 | (c2 & 0b0010) << 0 | (c3 & 0b0010) >> 1
-      b2 := (c1 & 0b0100) << 0 | (c2 & 0b0100) >> 1 | (c3 & 0b0100) >> 2
-      b3 := (c1 & 0b1000) >> 1 | (c2 & 0b1000) >> 2 | (c3 & 0b1000) >> 3
-      return [b0, b1, b2, b3]
-
   check_keys_ keys/List:
     keys.do:
       if it.size != 6: throw "Keys must be 6 bytes long"
@@ -1071,44 +1015,6 @@ class MifareCard extends Card:
       if is_trailer_block i: block_bytes.replace 0 key
       result.replace (i * 16) block_bytes
     return result
-
-  static data_access_bits_to_string bits/int -> string:
-    if bits == 0b000:
-      return "000 - read:AB, write:AB, increment:AB, decrement:AB"
-    if bits == 0b010:
-      return "010 - read:AB"
-    if bits == 0b100:
-      return "100 - read:AB, write:B"
-    if bits == 0b110:
-      return "110 - read:AB, write:B, increment:B, decrement:AB"
-    if bits == 0b001:
-      return "001 - read:AB, decrement:AB"
-    if bits == 0b011:
-      return "011 - read:B, write:B"
-    if bits == 0b101:
-      return "101 - read:B"
-    if bits == 0b111:
-      return "111 - no access"
-    unreachable
-
-  static trailer_access_bits_to_string bits/int -> string:
-    if bits == 0b000:
-      return "000 - Key A: Aw, Bits: Ar, Key B: Arw"
-    if bits == 0b010:
-      return "010 - Bits: Ar, Key B: Ar"
-    if bits == 0b100:
-      return "100 - Key A: Bw, Bits: Ar Br,  Key B: Bw"
-    if bits == 0b110:
-      return "110 - Bits: Ar Br"
-    if bits == 0b001:
-      return "001 - Key A: Aw, Bits: Arw, Key B: Arw"
-    if bits == 0b011:
-      return "011 - Key A: Bw, Bits: Ar Brw, Key B: Bw"
-    if bits == 0b101:
-      return "101 - Bits: Ar Brw"
-    if bits == 0b111:
-      return "111 - Bits: Ar Br"
-    unreachable
 
   /**
   Dumps the content of the card to stdout.
@@ -1145,23 +1051,21 @@ class MifareCard extends Card:
         blocks.add block_bytes
         block++
 
-      access_bits := access_bits_from_trailer blocks.last
+      access_bits := AccessBits.from_trailer blocks.last
       for i := 0; i < blocks.size; i++:
         block_bytes := blocks[i]
         block_str := ""
         block_bytes.do: block_str += "$(%02x it)"
-        access_bits_for_block := ?
+        area/int := ?
         if sector_size == 4:
-          access_bits_for_block = access_bits[i]
+          area = i
         else
-          if i < 5: access_bits_for_block = access_bits[0]
-          else if i < 10: access_bits_for_block = access_bits[1]
-          else if i < 15: access_bits_for_block = access_bits[2]
-          else: access_bits_for_block = access_bits[3]
+          if i < 5: area = 0
+          else if i < 10: area = 1
+          else if i < 15: area = 2
+          else: area = 3
 
-        legend := ?
-        if i != blocks.size - 1: legend = data_access_bits_to_string access_bits_for_block
-        else: legend = trailer_access_bits_to_string access_bits_for_block
+        legend := access_bits.stringify --area=area
 
         print "  $block_str ($legend)"
 
@@ -1182,12 +1086,397 @@ class MifareCard extends Card:
     if bcc != bytes[uid.size]: throw (MifareException.from_code MifareException.INVALID_UID_BCC)
 
   check_trailer_data_ byte/ByteArray --allow_lockout/bool:
+    access_bits := AccessBits.from_trailer byte
+    if allow_lockout: return
+    if not access_bits.can_write_access_bits --with_key_a --with_key_b:
+      throw (MifareException.from_code MifareException.ACCESS_BITS_LOCKOUT)
 
   reset_communication_:
     transceiver_.stop_crypto_
     halt_
     transceiver_.wake_up_cards_
     transceiver_.select_ uid
+
+
+/**
+Access bits of a Mifare card.
+
+A trailer block encodes 4 integers, each between 0 and 7.
+The first three integers provide the access bits for the data blocks.
+The list integer provides the access bits for the trailer block itself.
+
+When a sector has more than 3 data blocks (Mifare 4K), then the access bits are
+  applied as follows:
+  * b0 (the first byte), applies to blocks 0-4
+  * b1 (the second byte), applies to blocks 5-9
+  * b2 (the third byte), applies to blocks 10-14
+
+b3 is always the access bits for the trailer block.
+
+The meaning of the access bits for data blocks is as follows:
+```
+        read write increment decrement/transfer/restore
+0b000:   AB   AB      AB       AB    # Transport configuration
+0b010:   AB   --      --       --    # read/write block
+0b100:   AB    B      --       --    # read/write block
+0b110:   AB    B       B       AB    # value block
+0b001:   AB   --      --       AB    # value block
+0b011:    B    B      --       --    # read/write block
+0b101:    B   --      --       --    # read/write block
+0b111:   --   --      --       --    # read/write block
+```
+
+The meaning of the access bits for the trailer block is as follows.
+```
+        Key A, Access bits, Key B
+0b000: Aw   ,  Ar        , Arw      # Key B is readable.
+0b010:      ,  Ar        , Ar       # Key B is readable.
+0b100:    Bw,  Ar  Br    ,     Bw
+0b110:      ,  Ar  Br    ,
+0b001: Aw   ,  Arw       , Arw      # Transport configuration. Key B is readable.
+0b011:    Bw,  Ar  Brw   ,     Bw
+0b101:      ,  Ar  Brw   ,
+0b111:      ,  Ar  Br    ,
+```
+*/
+class AccessBits:
+  /**
+  Constructs the access bits for a data area.
+
+  Not all combinations of $key_a_read, $key_b_read, $key_a_write, $key_b_write,
+    $key_a_increment, $key_b_increment, $key_a_decrement, $key_b_decrement are possible.
+  */
+  static build_data_area_bits -> int
+      --key_a_read/bool --key_b_read/bool
+      --key_a_write/bool --key_b_write/bool
+      --key_a_increment/bool --key_b_increment/bool
+      --key_a_decrement/bool --key_b_decrement/bool:
+    if key_a_read and key_b_read and
+        key_a_write and key_b_write and
+        key_a_increment and key_b_increment and
+        key_a_decrement and key_b_decrement:
+      return 0b000
+    if key_a_read and key_b_read and
+        not key_a_write and not key_b_write and
+        not key_a_increment and not key_b_increment and
+        not key_a_decrement and not key_b_decrement:
+      return 0b010
+    if key_a_read and key_b_read and
+        not key_a_write and key_b_write and
+        not key_a_increment and not key_b_increment and
+        not key_a_decrement and not key_b_decrement:
+      return 0b100
+    if key_a_read and key_b_read and
+        not key_a_write and key_b_write and
+        not key_a_increment and key_b_increment and
+        key_a_decrement and key_b_decrement:
+      return 0b110
+    if key_a_read and key_b_read and
+        not key_a_write and not key_b_write and
+        not key_a_increment and not key_b_increment and
+        key_a_decrement and key_b_decrement:
+      return 0b001
+    if not key_a_read and key_b_read and
+        not key_a_write and key_b_write and
+        not key_a_increment and not key_b_increment and
+        not key_a_decrement and not key_b_decrement:
+      return 0b011
+    if not key_a_read and key_b_read and
+        not key_a_write and not key_b_write and
+        not key_a_increment and not key_b_increment and
+        not key_a_decrement and not key_b_decrement:
+      return 0b101
+    if not key_a_read and not key_b_read and
+        not key_a_write and not key_b_write and
+        not key_a_increment and not key_b_increment and
+        not key_a_decrement and not key_b_decrement:
+      return 0b111
+    throw "INVALID_ARGUMENT"
+
+  /**
+  Constructs the access bits for a trailer area.
+
+  Not all combinations of
+    $read_key_b_with_key_a,
+    $write_key_a_with_key_a, $write_key_a_with_key_b,
+    $write_key_b_with_key_a, $write_key_b_with_key_b,
+    $read_access_bits_with_key_a, $read_access_bits_with_key_b,
+    $write_access_bits_with_key_a, $write_access_bits_with_key_b are possible.
+  */
+  static build_trailer_bits -> int
+      --read_key_b_with_key_a/bool
+      --write_key_a_with_key_a/bool --write_key_a_with_key_b/bool
+      --write_key_b_with_key_a/bool --write_key_b_with_key_b/bool
+      --read_access_bits_with_key_a/bool --read_access_bits_with_key_b/bool
+      --write_access_bits_with_key_a/bool --write_access_bits_with_key_b/bool:
+    if read_key_b_with_key_a and
+        write_key_a_with_key_a and not write_key_a_with_key_b and
+        write_key_b_with_key_a and not write_key_b_with_key_b and
+        read_access_bits_with_key_a and not read_access_bits_with_key_b and
+        not write_access_bits_with_key_a and not write_access_bits_with_key_b:
+      return 0b000
+    if read_key_b_with_key_a and
+        not write_key_a_with_key_a and not write_key_a_with_key_b and
+        not write_key_b_with_key_a and not write_key_b_with_key_b and
+        read_access_bits_with_key_a and not read_access_bits_with_key_b and
+        not write_access_bits_with_key_a and not write_access_bits_with_key_b:
+      return 0b010
+    if not read_key_b_with_key_a and
+        not write_key_a_with_key_a and write_key_a_with_key_b and
+        not write_key_b_with_key_a and write_key_b_with_key_b and
+        read_access_bits_with_key_a and read_access_bits_with_key_b and
+        not write_access_bits_with_key_a and not write_access_bits_with_key_b:
+      return 0b100
+    if not read_key_b_with_key_a and
+        not write_key_a_with_key_a and not write_key_a_with_key_b and
+        not write_key_b_with_key_a and not write_key_b_with_key_b and
+        read_access_bits_with_key_a and read_access_bits_with_key_b and
+        not write_access_bits_with_key_a and not write_access_bits_with_key_b:
+      return 0b110
+    if read_key_b_with_key_a and
+        write_key_a_with_key_a and not write_key_a_with_key_b and
+        write_key_b_with_key_a and not write_key_b_with_key_b and
+        read_access_bits_with_key_a and not read_access_bits_with_key_b and
+        write_access_bits_with_key_a and not write_access_bits_with_key_b:
+      return 0b001
+    if not read_key_b_with_key_a and
+        not write_key_a_with_key_a and write_key_a_with_key_b and
+        not write_key_b_with_key_a and not write_key_b_with_key_b and
+        read_access_bits_with_key_a and read_access_bits_with_key_b and
+        not write_access_bits_with_key_a and write_access_bits_with_key_b:
+      return 0b011
+    if not read_key_b_with_key_a and
+        not write_key_a_with_key_a and not write_key_a_with_key_b and
+        not write_key_b_with_key_a and not write_key_b_with_key_b and
+        read_access_bits_with_key_a and read_access_bits_with_key_b and
+        not write_access_bits_with_key_a and write_access_bits_with_key_b:
+      return 0b101
+    if not read_key_b_with_key_a and
+        not write_key_a_with_key_a and not write_key_a_with_key_b and
+        not write_key_b_with_key_a and not write_key_b_with_key_b and
+        read_access_bits_with_key_a and read_access_bits_with_key_b and
+        not write_access_bits_with_key_a and not write_access_bits_with_key_b:
+      return 0b111
+    throw "INVALID_ARGUMENT"
+
+  b0 /int
+  b1 /int
+  b2 /int
+  b3 /int
+
+  constructor.from_trailer bytes/ByteArray:
+    if bytes.size != 16: throw "INVALID_ARGUMENT"
+    c1 := bytes[7] >> 4
+    c2 := bytes[8] & 0xf
+    c3 := bytes[8] >> 4
+    c1_ := bytes[6] & 0xf
+    c2_ := bytes[6] >> 4
+    c3_ := bytes[7] & 0xf
+
+    // cX_ should always be the inverted version of cX.
+    if c1_ != 0xf - c1 or c2_ != 0xf - c2 or c3_ != 0xf - c3:
+      throw (MifareException.from_code MifareException.INVALID_ACCESS_BITS)
+    else:
+      b0 = (c1 & 0b0001) << 2 | (c2 & 0b0001) << 1 | (c3 & 0b0001) << 0
+      b1 = (c1 & 0b0010) << 1 | (c2 & 0b0010) << 0 | (c3 & 0b0010) >> 1
+      b2 = (c1 & 0b0100) << 0 | (c2 & 0b0100) >> 1 | (c3 & 0b0100) >> 2
+      b3 = (c1 & 0b1000) >> 1 | (c2 & 0b1000) >> 2 | (c3 & 0b1000) >> 3
+
+  /**
+  Builds a instance with the given access bits for each area.
+  */
+  constructor .b0 .b1 .b2 .b3:
+    if not 0 <= b0 <= 7: throw "INVALID_ARGUMENT"
+    if not 0 <= b1 <= 7: throw "INVALID_ARGUMENT"
+    if not 0 <= b2 <= 7: throw "INVALID_ARGUMENT"
+    if not 0 <= b3 <= 7: throw "INVALID_ARGUMENT"
+
+  /**
+  Returns whether it is possible to read the blocks covered by the given $area with
+    key A (if $with_key_a is true) and/or key B (if $with_key_b is true).
+
+  The $area must be in range 0-2, as this function only covers the access bits for
+    data blocks.
+  */
+  can_read_data --area/int --with_key_a/bool --with_key_b/bool -> bool:
+    bits := area_to_bits_ area
+
+    if with_key_a:
+      if bits == 0b000 or bits == 0b010 or bits == 0b100 or bits == 0b110 or bits == 0b001: return true
+    if with_key_b:
+      if bits != 0b111: return true
+    return false
+
+  /**
+  Returns whether it is possible to write the blocks covered by the given $area with
+    key A (if $with_key_a is true) and/or key B (if $with_key_b is true).
+
+  The $area must be in range 0-2, as this function only covers the access bits for
+    data blocks.
+  */
+  can_write_data --area/int --with_key_a/bool --with_key_b/bool -> bool:
+    bits := area_to_bits_ area
+
+    if with_key_a and bits == 0b000: return true
+    if with_key_b:
+      if bits == 0b000 or bits == 0b100 or bits == 0b110 or bits == 0b011: return true
+    return false
+
+  /**
+  Returns whether is is possible increment the blocks covered by the given $area with
+    key A (if $with_key_a is true) and/or key B (if $with_key_b is true).
+
+  The $area must be in range 0-2, as this function only covers the access bits for
+    data blocks.
+  */
+  can_increment_data --area/int --with_key_a/bool --with_key_b/bool -> bool:
+    bits := area_to_bits_ area
+
+    if with_key_a and bits == 0b000: return true
+    if with_key_b and bits == 0b000 or bits == 0b110: return true
+    return false
+
+  /**
+  Returns whether is is possible decrement the blocks covered by the given $area with
+    key A (if $with_key_a is true) and/or key B (if $with_key_b is true).
+
+  The $area must be in range 0-2, as this function only covers the access bits for
+    data blocks.
+  */
+  can_decrement_data --area/int --with_key_a/bool --with_key_b/bool -> bool:
+    bits := area_to_bits_ area
+
+    if not with_key_a and not with_key_b: return false
+    return bits == 0b000 or bits == 0b110 or bits == 0b001
+
+  /**
+  Returns whether it is possible to read key B of the trailer block with key A.
+
+  Note: there is no `can_read_key_a` as key A is never readable.
+  */
+  can_read_key_b -> bool:
+    return b3 == 0b000 or b3 == 0b010 or b3 == 0b001
+
+  /**
+  Whether it is possible to write key A or B of the trailer block with key
+    A (if $with_key_a is true) and/or key B (if $with_key_b is true).
+  */
+  can_write_key --with_key_a/bool --with_key_b/bool -> bool:
+    if with_key_a:
+      if b3 == 0b000 or b3 == 0b001: return true
+    if with_key_b:
+    if b3 == 0b100 or b3 == 0b011: return true
+    return false
+
+  /**
+  Whether it is possible to read the access bits of the trailer block with key B.
+
+  Note: key A can always read the access bits.
+  */
+  can_read_access_bits --with_key_b/bool -> bool:
+    if not with_key_b: return false
+    return b3 == 0b100 or b3 == 0b110 or b3 == 0b011 or b3 == 0b101 or b3 == 0b111
+
+  /**
+  Whether it is possible to write the access bits of the trailer block with key A
+    (if $with_key_a is true) and/or key B (if $with_key_b is true).
+  */
+  can_write_access_bits --with_key_a/bool --with_key_b/bool -> bool:
+    if with_key_a and b3 == 0b001: return true
+    if with_key_b:
+      if b3 == 0b011 or b3 == 0b101: return true
+    return false
+
+  /**
+  Writes the access bits into the given $bytes trailer.
+
+  This modifies bytes 6, 7 and 8 of the $bytes.
+  */
+  write_into_trailer bytes/ByteArray:
+    if bytes.size != 16: throw "INVALID_ARGUMENT"
+
+    c1 := (b0 >> 2) & 0b0001 | (b1 >> 1) & 0b0010 | (b2 >> 0) & 0b0100 | (b3 << 1) & 0b1000
+    c2 := (b0 >> 1) & 0b0001 | (b1 >> 0) & 0b0010 | (b2 << 1) & 0b0100 | (b3 << 2) & 0b1000
+    c3 := (b0 >> 0) & 0b0001 | (b1 << 1) & 0b0010 | (b2 << 2) & 0b0100 | (b3 << 3) & 0b1000
+    c1_ := 0xf - c1
+    c2_ := 0xf - c2
+    c3_ := 0xf - c3
+    bytes[6] = (c2_ << 4) | c1_
+    bytes[7] = (c1 << 4) | c3_
+    bytes[8] = (c3 << 4) | c2
+
+  stringify -> string:
+    return """
+      $(data_access_bits_to_string b0)
+      $(data_access_bits_to_string b1)
+      $(data_access_bits_to_string b2)
+      $(trailer_access_bits_to_string b3)
+      """
+
+  area_to_bits_ area/int -> int:
+    if not 0 <= area <= 3: throw "INVALID_ARGUMENT"
+    if area == 0: return b0
+    else if area == 1: return b1
+    else if area == 2: return b2
+    return b3
+
+  /**
+  Stringifies the access bits for the given $area.
+
+  The $area value must be in range 0-3.
+  For Mifare 1K, the $area value is equivalent to the block in the sector.
+  For Mifare 4K, the $area value may cover multiple blocks.
+  */
+  stringify --area/int:
+    if not 0 <= area <= 3: throw "INVALID_ARGUMENT"
+    if area == 0: return data_access_bits_to_string b0
+    if area == 1: return data_access_bits_to_string b1
+    if area == 2: return data_access_bits_to_string b2
+    return trailer_access_bits_to_string b3
+
+  /**
+  Returns a string representation of the access bits of a data block ($b0, $b1, or $b2).
+  */
+  data_access_bits_to_string area/int -> string:
+    if area == 0b000:
+      return "000 - read:AB, write:AB, increment:AB, decrement:AB"
+    if area == 0b010:
+      return "010 - read:AB"
+    if area == 0b100:
+      return "100 - read:AB, write:B"
+    if area == 0b110:
+      return "110 - read:AB, write:B, increment:B, decrement:AB"
+    if area == 0b001:
+      return "001 - read:AB, decrement:AB"
+    if area == 0b011:
+      return "011 - read:B, write:B"
+    if area == 0b101:
+      return "101 - read:B"
+    if area == 0b111:
+      return "111 - no access"
+    unreachable
+
+  /**
+  Returns a string representation of the access bits of the trailer block ($b3).
+  */
+  trailer_access_bits_to_string bits/int -> string:
+    if bits == 0b000:
+      return "000 - Key A: Aw, Bits: Ar, Key B: Arw"
+    if bits == 0b010:
+      return "010 - Bits: Ar, Key B: Ar"
+    if bits == 0b100:
+      return "100 - Key A: Bw, Bits: Ar Br,  Key B: Bw"
+    if bits == 0b110:
+      return "110 - Bits: Ar Br"
+    if bits == 0b001:
+      return "001 - Key A: Aw, Bits: Arw, Key B: Arw"
+    if bits == 0b011:
+      return "011 - Key A: Bw, Bits: Ar Brw, Key B: Bw"
+    if bits == 0b101:
+      return "101 - Bits: Ar Brw"
+    if bits == 0b111:
+      return "111 - Bits: Ar Br"
+    unreachable
 
 
 class MifareException:
@@ -1208,8 +1497,11 @@ class MifareException:
   */
   static INVALID_UID_BCC ::= -2
   /**
-  The access bits of a trailer block are duplicated in such a way that each bit has
-    a corresponding inverted bit. This error is used when that's not the case.
+  Invalid access bits.
+
+  Normaly, the access bits of a trailer block are duplicated in such a way that
+    each bit has a corresponding inverted bit. This error is used when that's
+    not the case.
   */
   static INVALID_ACCESS_BITS ::= -3
 
@@ -1217,6 +1509,14 @@ class MifareException:
   The Mifare authentication failed.
   */
   static AUTHENTICATION_FAILED ::= -4
+
+  /**
+  Dangerous access bits.
+
+  This code is used when a user tries to write a trailer block with access bits
+    that would lock out the owner of the card.
+  */
+  static ACCESS_BITS_LOCKOUT ::= -5
 
   /** The received data, if any. */
   response/ByteArray?

@@ -88,6 +88,16 @@ main:
 
             mifare.write_to_stdout --keys=keys
 
+            // mifare.authenticate --block=3 --is_key_a (keys and keys[0])
+            // trailer := mifare.read --block=3
+            // access_bits := mfrc522.AccessBits.from_trailer trailer
+            // print "Access bits:\n$access_bits"
+            // print "trailer: $trailer"
+            // access_bits.write_into_trailer trailer
+            // print "after:   $trailer"
+            // access_bits2 := mfrc522.AccessBits.from_trailer trailer
+            // print "Access bits2:\n$access_bits2"
+
             // key1 := #[ 0x3e, 0x65, 0xe4, 0xfb,0x65,0xb3]
             // keys := []
             // 5.repeat: keys.add mfrc522.MifareCard.DEFAULT_KEY
