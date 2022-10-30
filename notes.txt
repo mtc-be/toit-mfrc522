@@ -30,6 +30,24 @@ tag     24 5c db ee
 reader  58 47 67 bf 68 6f 4f b9
 tag     60 21 b9 3d
 
+Trace with key 0xFFFFFFFFFFFF: (from https://ora.ox.ac.uk/catalog/uuid:8e52bcfe-5ab5-40b8-b1f4-6b11fd0e67f2/download_file?file_format=application%2Fpdf&safe_filename=12-15.pdf)
+UID: 0xCD 0x76 0x92 0x74
+Reader -> Tag: 0x60 0x3C 0x1A 0x80  // Auth Key A address 0x3C
+Tag -> Reader: 0x0E 0x61 0x64 0xD6  // n_T
+Reader -> Tag: 0x15 0x45 0x90 0xA8   --  0x78 0x5A 0x41 0x80  // n_R. Right is encrypted.
+Reader -> Tag: 0x4F 0x4E 0x67 0x4E   --  0x50 0x04 0x7F 0x22  // a_R.
+Tag -> Reader: 0x41 0x3E 0xEB 0xCF   --  0xCE 0xCA 0x0D 0x83  // a_T.
+Reader -> Tag: 0x30      --  0x69       // Read. Right is encrypted.
+Reader -> Tag: 0x3F      --  0xAC       // Address
+Reader -> Tag: 0x76 0x61 --  0x4F 0x02  // CRC
+
+
+
+Good explanation of Crypto-1.
+Wirelessly Pickpocketing a Mifare Classic Card:
+https://repository.ubn.ru.nl/bitstream/handle/2066/75545/1/75545.pdf
+Dismantling Mifare:
+https://www.cs.bham.ac.uk/~garciaf/publications/Dismantling.Mifare.pdf
 
 darkside attack: uses parity.
 
@@ -51,7 +69,9 @@ https://www.nxp.com/docs/en/data-sheet/MF1S50YYX_V1.pdf
 Distinguishing between Mifare cards: https://www.newark.com/pdfs/techarticles/nxp/AN10833.pdf
 
 Mifare Ultralight: https://www.nxp.com/docs/en/application-note/AN11340.pdf
-
+Ultralight protocol description:
+Also contains description of how to build your own tag emulator.
+https://ora.ox.ac.uk/catalog/uuid:8e52bcfe-5ab5-40b8-b1f4-6b11fd0e67f2/download_file?file_format=application%2Fpdf&safe_filename=12-15.pdf
 
 Presentation.
 Nice detailed discription and how a minimal reader was built:
