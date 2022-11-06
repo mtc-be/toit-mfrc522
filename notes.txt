@@ -1,14 +1,3 @@
-                      -> auth(block)
-                     <- picks n_t (nonce)
-                                             ks1 <- cipher(K, uid, n_t)
-ks1 <- cipher(K, uid, n_t)
-picks n_r
-ks2, ks3, ... <- cipher(K, uid, n_t, n_r)
-                       -> n_r X ks1, suc2(n_t) X ks2
-                                             ks2, ks3 ... <- cipher(K, uid, n_t, n_r)
-                       <-- suc3(n_t) X ks3
-
-
 Reader: 26  // req type A
 Tag:    04 00  // answer req
 Reader: 93 20   // select
