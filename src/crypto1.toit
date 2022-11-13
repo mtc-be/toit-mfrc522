@@ -150,13 +150,13 @@ The reader then constructs a 4-byte challeng n_R by . It sends this challenge to
   unencrypted bit with the result of the LSFR feedback and uses it to shift the
   LFSR state.
 In the same communication, the reader also sends the response to the challenge n_T,
-  which is the suc²(n_T) (that is, the PRNG value after 64 iterations, where the
+  which is the suc⁶⁴(n_T) (that is, the PRNG value after 64 iterations, where the
   seed was n_T). The challenge response is sent encrypted using the normal
   stream cipher.
 
 The tag decrypts the challenge n_R, and feeds the unencrypted bits into the LFSR as
   soon as they are available. It also verifies that the challeng response is correct.
-It finishes the authentication by sending suc³(n_R) (that is, the PRNG value
+It finishes the authentication by sending suc⁹⁶(n_T) (that is, the PRNG value
   after 96 iterations) to the reader.
 
 At this stage the cipher has been initialized and both sides share the same LFSR state.
@@ -242,6 +242,9 @@ class Crypto1Prng:
   constructor seed/int=0:
     set_state seed
 
+  constructor --seed_bytes/ByteArray:
+    set_state --bytes=seed_bytes
+
   set_state state/int:
     lfsr_state_ = invert_ state
 
@@ -284,35 +287,303 @@ class Crypto1Prng:
     return result
 
 
-interface ConnectionEncrypter:
+class MifareCryptoReader:
   /**
-  En/decrypts the given $bytes.
-
-  If $in_place is true, modifies the given $bytes in place. Otherwise creates a copy.
+  The key has been used to initialize the LFSR.
   */
-  crypt --in_place/bool bytes/ByteArray
+  static STATE_0_KEY_INITIALIZED_ ::= 0
+  /**
+  The UID and tag nonce have been fed into the LFSR.
+  */
+  static STATE_1_UID_AND_NONCE_FED_ ::= 1
+  /**
+  The reader nonce has been encrypted and fed into the LFSR.
+  */
+  static STATE2_READER_NONCE_ENCRYPTED_AND_FED_ ::= 2
+  /**
+  The tag response has been checked.
+  */
+  static STATE_3_TAG_RESPONSE_CHECKED_ ::= 3
 
-class IdentityEncrypter implements ConnectionEncrypter:
-  crypt --in_place/bool bytes/ByteArray:
-    if not in_place: throw "INVALID_ARGUMENT"
-    return bytes
+  crypto1_/Crypto1
+  state_/int := ?
+  uid/ByteArray
+  nonce_tag_/ByteArray? := null
+  /**
+  The expected challenge response of the tag.
 
-class Crypto1Encrypter implements ConnectionEncrypter:
-  crypto1/Crypto1
+  To finish the authentication the tag sends this response back to the reader.
+  This response is suc⁹⁶(n_T), where n_T is the tag nonce.
+  */
+  expected_response_tag_/ByteArray? := null
 
-  constructor key/ByteArray:
-    crypto1 = Crypto1 --key=key
+  constructor --.uid/ByteArray key/ByteArray:
+    crypto1_ = Crypto1 --key=key
+    state_ = STATE_0_KEY_INITIALIZED_
 
-  crypt --in_place/bool bytes/ByteArray -> ByteArray:
-    if not in_place: bytes = bytes.copy
-    bytes.size.repeat: | byte_index |
-      byte := bytes[byte_index]
-      8.repeat:
-        byte ^= crypto1.cipher_bit << it
-      bytes[byte_index] = byte
-    return bytes
+  /**
+  Generates the challenge response to the tag's nonce.
 
-main:
+  As a side-effect:
+  - first feeds the $uid xor $nonce_tag into the LFSR.
+  - then encrypts the $nonce_reader. At the same time, feeds the $nonce_reader
+    into the LFSR.
+
+  The $nonce_tag is also used to generate the challenge response; both for
+    the reader, and the tag. See $check_tag_response or $skip_tag_response_check.
+  */
+  generate_challenge_response --nonce_tag/ByteArray --nonce_reader/ByteArray -> ByteArray:
+    if state_ != STATE_0_KEY_INITIALIZED_: throw "Invalid state"
+
+    // Feed the UID⊕nonce_tag into the LFSR.
+    feed_uid_xor_nonce_tag_ --nonce_tag=nonce_tag
+
+    if state_ != STATE_1_UID_AND_NONCE_FED_: throw "INVALID_STATE"
+    if nonce_reader.size != 4: throw "INVALID_NONCE_READER"
+
+    // Encrypt the nonce_reader, while feeding it into the LFSR.
+    encrypted_nonce_reader := ByteArray 4: |index|
+      byte := nonce_reader[index]
+      8.repeat: | bit_index |
+        cipher_bit := crypto1_.cipher_bit --should_shift=false
+        plain_bit := (byte >> bit_index) & 1
+        byte ^= cipher_bit << bit_index
+        crypto1_.shift plain_bit
+      byte
+
+    state_ = STATE2_READER_NONCE_ENCRYPTED_AND_FED_
+
+    // Generate the challenge responses.
+    prng := Crypto1Prng
+    prng.set_state --bytes=nonce_tag
+
+    prng.shift 64
+    answer_reader := prng.current_bytes
+    prng.shift 32
+    expected_response_tag_ = prng.current_bytes
+
+    crypt --in_place answer_reader --no-check_state
+
+    return encrypted_nonce_reader + answer_reader
+
+  /**
+  Checks whether the tag response is correct.
+
+  This is the last step of the authentication process. The tag is supposed
+    to send an encrypted successor of the tag nonce. This method checks
+    that the response is correct.
+
+  If $in_place is true, decrypts the response in-place, modifying the
+    $tag_response parameter.
+
+  This method changes the internal state so that the $crypt method is available.
+  */
+  check_tag_response --in_place/bool tag_response/ByteArray -> none:
+    if not decrypt_and_compare_tag_response_ --in_place=in_place tag_response:
+      throw "INVALID_TAG_RESPONSE"
+    state_ = STATE_3_TAG_RESPONSE_CHECKED_
+
+  /**
+  Skips the tag response check.
+
+  This function still decrypts the tag response (which is necessary to synchronize
+    the LFSR of the reader and the tag), but does not check whether the response
+    is correct.
+
+  This method changes the internal state so that the $crypt method is available.
+  */
+  skip_tag_response_check --in_place/bool tag_response/ByteArray -> none:
+    decrypt_and_compare_tag_response_ --in_place=in_place tag_response
+    state_ = STATE_3_TAG_RESPONSE_CHECKED_
+
+  decrypt_and_compare_tag_response_ --in_place/bool tag_response/ByteArray -> bool:
+    if state_ != STATE2_READER_NONCE_ENCRYPTED_AND_FED_: throw "Invalid state"
+    if tag_response.size != 4: throw "Invalid tag response"
+    assert: expected_response_tag_ != null
+
+    crypt --in_place=in_place tag_response --no-check_state
+
+    return tag_response == expected_response_tag_
+
+  crypt --in_place/bool data/ByteArray --check_state/bool=true -> ByteArray:
+    if check_state and state_ != STATE_3_TAG_RESPONSE_CHECKED_: throw "Invalid state"
+
+    if not in_place: data = data.copy
+
+    data.size.repeat: |index|
+      byte := data[index]
+      8.repeat: | bit_index |
+        cipher_bit := crypto1_.cipher_bit
+        byte ^= cipher_bit << bit_index
+      data[index] = byte
+
+    return data
+
+  /**
+  Feeds the $uid and $nonce_tag into the LFSR.
+
+  This is the second step of the authentication (after the initial key setting).
+
+  The $nonce_tag is sent by the tag as a response to an authentication request.
+    It is generally generated by a $Crypto1Prng, but non-compliant tags can use
+    any value.
+
+  The $nonce_tag is stored internally, so it is available for the
+  */
+  feed_uid_xor_nonce_tag_ --nonce_tag/ByteArray:
+    if state_ != STATE_0_KEY_INITIALIZED_: throw "INVALID_STATE"
+    if uid.size != 4: throw "INVALID_UID"
+    if nonce_tag.size != 4: throw "INVALID_NONCE_TAG"
+
+    xored := ByteArray 4: uid[it] ^ nonce_tag[it]
+
+    xored_value := LITTLE_ENDIAN.uint32 xored 0
+    32.repeat:
+      crypto1_.shift xored_value & 1
+      xored_value >>= 1
+
+    state_ = STATE_1_UID_AND_NONCE_FED_
+
+
+class MifareCryptoWriter:
+  /**
+  The key has been used to initialize the LFSR.
+  */
+  static STATE_0_KEY_INITIALIZED_ ::= 0
+  /**
+  The UID and tag nonce have been fed into the LFSR.
+  */
+  static STATE_1_UID_AND_NONCE_FED_ ::= 1
+  /**
+  The reader nonce has been encrypted and fed into the LFSR.
+  */
+  static STATE2_READER_NONCE_ENCRYPTED_AND_FED_ ::= 2
+  /**
+  The reader response has been checked.
+  */
+  static STATE_3_READER_RESPONSE_CHECKED_ ::= 3
+
+  crypto1_/Crypto1
+  state_/int := ?
+  uid/ByteArray
+  nonce_tag_/ByteArray? := null
+
+  constructor --.uid/ByteArray key/ByteArray:
+    crypto1_ = Crypto1 --key=key
+    state_ = STATE_0_KEY_INITIALIZED_
+
+  /**
+  Generates a nonce for the tag.
+
+  Tags that are compliant get their nonce from a $Crypto1Prng. Non-compliant
+    tags can use any value.
+
+  Initializes a $Crypto1Prng with the given $seed and forwards the generater
+    16 times to reach a consistent state.
+
+  Returns the result of the PRNG after the 16 iterations.
+  */
+  generate_nonce --seed/int -> ByteArray:
+    prng := Crypto1Prng seed
+    prng.shift 16
+    return prng.current_bytes
+
+  /**
+  Starts the authentication process.
+
+  The reader starts by sending an authentication request. The tag
+    starts the authentication process by sending back a nonce.
+
+  As part of the authentication process feeds the $uid xor $tag_nonce into
+    the LFSR.
+
+  The $tag_nonce is generally generated by a $Crypto1Prng (see $generate_nonce),
+    but non-compliant tags can use any value.
+
+  The $tag_nonce is later used to generate the challenge response; both for
+    the reader, and the tag. See $handle_reader_response.
+  */
+  start_authentication --tag_nonce/ByteArray:
+    if state_ != STATE_0_KEY_INITIALIZED_: throw "INVALID_STATE"
+    if uid.size != 4: throw "INVALID_UID"
+    if tag_nonce.size != 4: throw "INVALID_NONCE_TAG"
+
+    nonce_tag_ = tag_nonce
+
+    xored := ByteArray 4: uid[it] ^ tag_nonce[it]
+
+    xored_value := LITTLE_ENDIAN.uint32 xored 0
+    32.repeat:
+      crypto1_.shift xored_value & 1
+      xored_value >>= 1
+
+    state_ = STATE_1_UID_AND_NONCE_FED_
+
+  /**
+  Handles the reader's response.
+
+  This is the second step of the authentication process. After it has received
+    the tag's nonce, the reader sends its own nonce, together with the challenge
+    response to the tag.
+
+  Returns the tag's challenge response, finishing the authentication.
+  */
+  handle_reader_response -> ByteArray
+      --in_place/bool
+      reader_response/ByteArray
+      --check_challenge_response/bool=true:
+    if state_ != STATE_1_UID_AND_NONCE_FED_: throw "INVALID_STATE"
+    if reader_response.size != 8: throw "INVALID_READER_RESPONSE"
+
+    encrypted_nonce_reader := reader_response[0..4]
+    challenge_response := reader_response[4..8]
+
+    // Decrypt the reader nonce, while feeding it into the LFSR.
+    // We don't care for the result, as the decrypted nonce is
+    // immediately fed into the LFSR.
+    4.repeat: |index|
+      byte := encrypted_nonce_reader[index]
+      8.repeat: | bit_index |
+        cipher_bit := crypto1_.cipher_bit --should_shift=false
+        byte ^= cipher_bit << bit_index
+        plain_bit := (byte >> bit_index) & 1
+        crypto1_.shift plain_bit
+      byte
+
+    state_ = STATE2_READER_NONCE_ENCRYPTED_AND_FED_
+
+    prng := Crypto1Prng --seed_bytes=nonce_tag_
+    prng.shift 64
+    expected_challenge_response_reader := prng.current_bytes
+    prng.shift 32
+    response_tag := prng.current_bytes
+
+    // Decrypt the challenge response.
+    crypt --in_place challenge_response --no-check_state
+
+    if check_challenge_response:
+      if challenge_response != expected_challenge_response_reader:
+        throw "INVALID_CHALLENGE_RESPONSE"
+    state_ = STATE_3_READER_RESPONSE_CHECKED_
+
+    crypt --in_place response_tag
+    return response_tag
+
+  crypt --in_place/bool data/ByteArray --check_state/bool=true -> ByteArray:
+    if check_state and state_ != STATE_3_READER_RESPONSE_CHECKED_: throw "Invalid state"
+
+    if not in_place: data = data.copy
+
+    data.size.repeat: |index|
+      byte := data[index]
+      8.repeat: | bit_index |
+        cipher_bit := crypto1_.cipher_bit
+        byte ^= cipher_bit << bit_index
+      data[index] = byte
+
+    return data
+
+main2:
 //  key := #[ 0xd7, 0x96, 0x86, 0x65, 0xfb, 0x36 ]
 
   // Given the diagram at https://en.wikipedia.org/wiki/Crypto-1#/media/File:Crypto1.png
@@ -425,3 +696,28 @@ main:
   // Both states are now the same:
   print "Reader state: $(%x reader_crypto1.lfsr_state_)"
   print "Tag state:    $(%x tag_crypto1.lfsr_state_)"
+
+main:
+//  key := #[ 0xd7, 0x96, 0x86, 0x65, 0xfb, 0x36 ]
+
+  // Given the diagram at https://en.wikipedia.org/wiki/Crypto-1#/media/File:Crypto1.png
+  // Then key[0] & 0 is equal to key_0 and key[6] & 0x80 is equal to key_47.
+  key := #[ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff ]
+
+  uid := #[0xcd, 0x76, 0x92, 0x74]
+  n_t := #[0x0e, 0x61, 0x64, 0xD6]
+  n_r := #[0x15, 0x45, 0x90, 0xa8]
+
+  crypto_reader := MifareCryptoReader key --uid=uid
+  crypto_writer := MifareCryptoWriter key --uid=uid
+
+  crypto_writer.start_authentication --tag_nonce=n_t
+  reader_response := crypto_reader.generate_challenge_response --nonce_tag=n_t --nonce_reader=n_r
+
+  writer_response := crypto_writer.handle_reader_response --in_place reader_response
+
+  crypto_reader.check_tag_response --in_place writer_response
+
+  // Both states are now the same:
+  print "Reader state: $(%x crypto_reader.crypto1_.lfsr_state_)"
+  print "Tag state:    $(%x crypto_writer.crypto1_.lfsr_state_)"
