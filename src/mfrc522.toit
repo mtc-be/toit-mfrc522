@@ -347,14 +347,15 @@ class Mfrc522:
     // We must not use `read_bytes` for SPI. That doesn't yield the correct result.
     result_bytes := ByteArray response_size: registers_.read_u8 FIFO_DATA_REGISTER_
 
-    // TODO(florian): read the last-byte bits.
-    // Add collision information.
-    result_frame :=  ReceivedFrame result_bytes[..result_bytes.size - 2]
-        --collision_position=null
-        --size_in_bits=(response_size * 8)
-
     if check_crc:
       check_crc_ result_bytes
+      result_bytes = result_bytes[..result_bytes.size - 2]
+
+    // TODO(florian): read the last-byte bits.
+    // Add collision information.
+    result_frame :=  ReceivedFrame result_bytes
+        --collision_position=null
+        --size_in_bits=(response_size * 8)
 
     return result_frame
 
