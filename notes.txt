@@ -19,12 +19,12 @@ tag     24 5c db ee
 reader  58 47 67 bf 68 6f 4f b9
 tag     60 21 b9 3d
 
-Trace with key 0xFFFFFFFFFFFF: (from https://ora.ox.ac.uk/catalog/uuid:8e52bcfe-5ab5-40b8-b1f4-6b11fd0e67f2/download_file?file_format=application%2Fpdf&safe_filename=12-15.pdf)
+Trace with key 0xFFFFFFFFFFFF: (from https://ora.ox.ac.uk/objects/uuid:8e52bcfe-5ab5-40b8-b1f4-6b11fd0e67f2/download_file?file_format=application%2Fpdf&safe_filename=12-15.pdf&type_of_work=Working+paper)
 UID: 0xCD 0x76 0x92 0x74
 Reader -> Tag: 0x60 0x3C 0x1A 0x80  // Auth Key A address 0x3C
 Tag -> Reader: 0x0E 0x61 0x64 0xD6  // n_T
 Reader -> Tag: 0x15 0x45 0x90 0xA8   --  0x78 0x5A 0x41 0x80  // n_R. Right is encrypted.
-Reader -> Tag: 0x4F 0x4E 0x67 0x4E   --  0x50 0x04 0x7F 0x22  // a_R.
+Reader -> Tag: 0x4F 0x4E 0x67 0x4E   --  0x50 0x04 0x8F 0x22  // a_R.
 Tag -> Reader: 0x41 0x3E 0xEB 0xCF   --  0xCE 0xCA 0x0D 0x83  // a_T.
 Reader -> Tag: 0x30      --  0x69       // Read. Right is encrypted.
 Reader -> Tag: 0x3F      --  0xAC       // Address

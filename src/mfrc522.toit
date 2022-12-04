@@ -7,6 +7,7 @@ A driver for the MFRC522 RFID reader.
 */
 
 import serial
+import .crypto1
 
 class RfidException:
   /**
@@ -74,6 +75,7 @@ class Mfrc522:
   static STATUS_2_REGISTER_ ::= 0x08 << 1
   static FIFO_DATA_REGISTER_ ::= 0x09 << 1
   static FIFO_LEVEL_REGISTER_ ::= 0x0A << 1
+  static CONTROL_REGISTER_ ::= 0x0C << 1
   static BIT_FRAMING_REGISTER_ ::= 0x0D << 1
   static COLL_REGISTER_ ::= 0x0E << 1
   static MODE_REGISTER_ ::= 0x11 << 1
@@ -100,6 +102,8 @@ class Mfrc522:
   static COMMAND_SOFT_RESET_ ::= 0x0F          // Resets the MFRC522.
 
   registers_ /serial.Registers
+
+  crypto_ /MifareCryptoReader? := null
 
   constructor device/serial.Device:
     registers_ = device.registers
@@ -154,28 +158,50 @@ class Mfrc522:
 
   See section Iso 14443-3 2008; section 6.2.3.1.
   */
-  transceive_short_ command/int --allow_collision -> ByteArray?:
+  transceive_short_ command/int --allow_collision -> ReceivedFrame?:
     if command >= 0x80: throw "INVALID_ARGUMENT"
 
     // Send only 7 bits of the last (only) byte.
     set_framing_ --tx_last_bits=7
 
-    return transceive_ #[command] --allow_collision=allow_collision
+    //TODO: remove the framing and move it to `transceive`.
+
+    frame := Frame #[command] --size_in_bits=7
+    return transceive_ frame --allow_collision=allow_collision
 
   /**
   Transmits a standard frame and returns the response.
 
-  Automatically adds the CRC.
-
   If $check_crc is true, then automatically checks the crc of the response.
+  If $add_crc is true, then automatically adds the CRC to the $bytes. This is almost
+    always the correct choice. The only exception is when the reader is authenticating
+    a Mifare card.
+
+  If $crypto_ is not null then uses it to encrypt the data.
   */
-  transceive_standard_ bytes/ByteArray --check_crc/bool=false -> ByteArray?:
-    crc := compute_crc_ bytes
-    bytes += #[crc & 0xFF, (crc >> 8) & 0xFF]
+  transceive_standard_ bytes/ByteArray --check_crc/bool=false --add_crc/bool=true -> ReceivedFrame?:
+    if add_crc:
+      crc := compute_crc_ bytes
+      bytes += #[crc & 0xFF, (crc >> 8) & 0xFF]
+
+    if crypto_:
+      bytes = crypto_.crypt bytes
 
     // Send all 8 bits of the last (only) byte.
     set_framing_ --tx_last_bits=0
-    return transceive_ bytes --check_crc=check_crc
+    // TODO: remove the set_framing_ and move it to the `transceive` function.
+    frame := Frame bytes
+    return transceive_ frame --check_crc=check_crc
+
+  // /**
+  // Transmits the raw bits of $bytes and returns the raw response.
+
+  // The reader does *not* add any CRC or parity bits when transceiving. The $bytes
+  //   array must contain these bits. Similarly, the response does contain parity
+  //   bits (if the writer sent them).
+
+  // */
+  // transceive_raw_ bytes/ByteArray --last_byte_bits/int=((bytes.size / 9 * 9) % 8) -> ReceivedFrame?:
 
   /**
   Transmits an anticollision frame and returns the response.
@@ -183,16 +209,22 @@ class Mfrc522:
   An anticollision frame might have only some bits of the last byte that are valid. During
     sending only those last bits are used. During receiving the first bits are shifted as to
     complete the byte.
+
+  The $last_byte_bits parameter specifies how many bits of the last byte are valid. It must
+    be between 1 and 8.
+
+  The response is automatically shifted, so that it would complete the last byte.
   */
-  transceive_anticollision_ bytes/ByteArray --last_byte_bits/int -> ByteArray?:
+  transceive_anticollision_ bytes/ByteArray --last_byte_bits/int -> ReceivedFrame?:
     // We want to send only 'tx_last_bits' bits. The remaining bits should be ignored.
-    tx_last_bits := last_byte_bits
-    // When receiving, the first bit sholud be shifted by 'rx_align' which is the same as the
-    // bits w
-    rx_align := last_byte_bits
+    tx_last_bits := (last_byte_bits % 8)
+    // When receiving, the first bit should be shifted by 'rx_align', so that the
+    // combination of the original and the new bits align.
+    rx_align := (last_byte_bits % 8)
 
     set_framing_ --rx_align=rx_align --tx_last_bits=tx_last_bits
-    return transceive_ bytes --allow_collision
+    frame := Frame bytes --size_in_bits=((bytes.size - 1) * 8 + last_byte_bits)
+    return transceive_ frame --allow_collision --shift_response_by=rx_align
 
   /**
   Sets the framing for future transmissions.
@@ -223,9 +255,13 @@ class Mfrc522:
     //     bits of the last byte that will be transmitted. 0 indicates that all bits should be transmitted.
     registers_.write_u8 BIT_FRAMING_REGISTER_ ((rx_align << 4) | tx_last_bits)
 
-  transceive_ bytes/ByteArray --command/int=COMMAND_TRANSCEIVE_ --allow_collision/bool=false --check_crc/bool=false -> ByteArray?:
+  transceive_ frame/Frame -> ReceivedFrame?
+      --command/int=COMMAND_TRANSCEIVE_  // Can be 'mfauthenticate'
+      --allow_collision/bool=false
+      --check_crc/bool=false
+      --shift_response_by/int=0:
     // The FIFO can handle up to 64 bytes.
-    if bytes.size > 64: throw "INVALID_ARGUMENT"
+    if frame.bytes.size > 64: throw "INVALID_ARGUMENT"
     // Cancel any existing command.
     registers_.write_u8 COMMAND_REGISTER_ COMMAND_IDLE_
 
@@ -238,7 +274,7 @@ class Mfrc522:
     registers_.write_u8 FIFO_LEVEL_REGISTER_ 0x80
 
     // Write the data into the FIFO.
-    registers_.write_bytes FIFO_DATA_REGISTER_ bytes
+    registers_.write_bytes FIFO_DATA_REGISTER_ frame.bytes
 
     // Send the command.
     registers_.write_u8 COMMAND_REGISTER_ command
@@ -309,12 +345,18 @@ class Mfrc522:
 
     response_size := registers_.read_u8 FIFO_LEVEL_REGISTER_
     // We must not use `read_bytes` for SPI. That doesn't yield the correct result.
-    result := ByteArray response_size: registers_.read_u8 FIFO_DATA_REGISTER_
+    result_bytes := ByteArray response_size: registers_.read_u8 FIFO_DATA_REGISTER_
+
+    // TODO(florian): read the last-byte bits.
+    // Add collision information.
+    result_frame :=  ReceivedFrame result_bytes[..result_bytes.size - 2]
+        --collision_position=null
+        --size_in_bits=(response_size * 8)
 
     if check_crc:
-      check_crc_ result
-      return result[..result.size - 2]
-    return result
+      check_crc_ result_bytes
+
+    return result_frame
 
   /**
   Computes the CRC as required by the ISO 14443-3 standard.
@@ -380,15 +422,26 @@ class Mfrc522:
         encoded_valid_bits := ((valid_uid_bytes + 2) << 4) + valid_bits
         bytes[index++] = encoded_valid_bits
 
-        to_copy := valid_bits == 0 ? valid_uid_bytes : valid_uid_bytes + 1
+        last_byte_bits/int := ?
+        to_copy/int := ?
+        if valid_bits == 0:
+          last_byte_bits = 8
+          to_copy = valid_uid_bytes
+        else:
+          last_byte_bits = valid_bits
+          to_copy = valid_uid_bytes + 1
+
         for i := 0; i < to_copy; i++:
           bytes[index++] = uid_buffer[i]
 
         // Request the PICCs to complete the ID and watch for collisions.
-        response := transceive_anticollision_ bytes[..index] --last_byte_bits=valid_bits
-        if not response: throw RfidException.no_response
+        response_frame := transceive_anticollision_ bytes[..index] --last_byte_bits=last_byte_bits
+        if not response_frame: throw RfidException.no_response
+
+        response := response_frame.bytes
 
         // The PICC is supposed to complete the UID and add a checksum (BCC).
+        print "response-size: $response.size valid_uid_bytes: $valid_uid_bytes"
         if response.size + valid_uid_bytes != 5:
           throw RfidException.protocol
 
@@ -459,9 +512,11 @@ class Mfrc522:
     // A select also needs the BCC and the CRC.
     bcc := bytes[2] ^ bytes[3] ^ bytes[4] ^ bytes[5]
     bytes[6] = bcc
-    response := transceive_standard_ bytes --check_crc
+    response_frame := transceive_standard_ bytes --check_crc
 
-    if not response: throw RfidException.no_response
+    if not response_frame: throw RfidException.no_response
+
+    response := response_frame.bytes
     // The SAK must be exactly 1 bytes long (once the CRC has been removed).
     if response.size != 1: throw RfidException.protocol
     return response
@@ -553,7 +608,6 @@ class Mfrc522:
     // Bit 3: MFCrypto1On. Indicates that the MIFARE Crypto1 unit is switched on.
     return (registers_.read_u8 STATUS_2_REGISTER_) & 0x08 != 0
 
-  // TODO(florian): add support for key B.
   authenticate_ --block/int --key/ByteArray --uid/ByteArray --is_key_a/bool -> bool:
     if uid.size != 4 and uid.size != 7 and uid.size != 10: throw "INVALID_ARGUMENT"
     if key.size != 6: throw "INVALID_ARGUMENT"
@@ -579,7 +633,8 @@ class Mfrc522:
     // See section 10.1.3 of MIFARE Classic EV1 1K spec.
     bytes.replace 8 uid[uid.size - 4  ..]
 
-    result := transceive_ --command=COMMAND_MF_AUTHENT_ bytes
+    frame := Frame bytes
+    result := transceive_ --command=COMMAND_MF_AUTHENT_ frame
     return result != null
 
   stop_crypto_:
@@ -588,7 +643,67 @@ class Mfrc522:
     old := registers_.read_u8 STATUS_2_REGISTER_
     registers_.write_u8 STATUS_2_REGISTER_ (old & ~0x08)
 
-  wake_up_cards_ --only_new/bool=false -> ByteArray?:
+  /*
+  is_authenticated_ -> bool:
+    return crypto_ != null
+
+  authenticate_ --block/int --key/ByteArray --uid/ByteArray --is_key_a/bool -> bool:
+    if uid.size != 4 and uid.size != 7 and uid.size != 10: throw "INVALID_ARGUMENT"
+    if key.size != 6: throw "INVALID_ARGUMENT"
+
+    // See MIFARE Classic EV1 1K spec.
+    // https://www.nxp.com/docs/en/data-sheet/MF1S50YYX_V1.pdf
+    // Section 9.1.
+    AUTHENT_KEY_A_COMMAND ::= 0x60
+    AUTHENT_KEY_B_COMMAND ::= 0x61
+
+    nonce_tag_frame := transceive_standard_ --no-check_crc #[
+      is_key_a ? AUTHENT_KEY_A_COMMAND : AUTHENT_KEY_B_COMMAND,
+      block,
+    ]
+
+    CONTINUE HERE
+    // TODO(florian): we need to disable the automatic parity of the MFRC522.
+    // We need to call `--add_parity_bits` when calling the mifare-authenticator.
+    // The enabling/disabling of the parity should probably be done through a transceive_raw_.
+    // disable: MF_RX_REG = 0x10
+    // enable: MF_RX_REG = 0x00
+
+    print "nonce_tag_frame: $nonce_tag_frame"
+    if not nonce_tag_frame:
+      print "no nonce_tag"
+      return false
+
+    nonce_tag := nonce_tag_frame.bytes
+
+    // If there was already a crypto1 session, drop it now.
+    crypto_ = null
+
+    // In theory this should be a random number.
+    nonce_reader := nonce_tag //  #[ 0x00, 0x00, 0x00, 0x00 ]
+
+    sleep --ms=10
+    new_crypto := MifareCryptoReader key --uid=uid
+    challenge_response := new_crypto.generate_challenge_response
+        --nonce_tag=nonce_tag
+        --nonce_reader=nonce_reader
+    tag_response := transceive_standard_ challenge_response --no-check_crc --no-add_crc
+
+    if not tag_response:
+      print "no tag response"
+      return false
+
+    succeeded := new_crypto.compare_tag_response challenge_response
+
+    if succeeded: crypto_ = new_crypto
+    return succeeded
+
+  stop_crypto_:
+    crypto_ = null
+
+  */
+
+  wake_up_cards_ --only_new/bool=false -> ReceivedFrame?:
     reset_communication_
 
     // Wake up the given PICC.
@@ -729,6 +844,39 @@ class Mfrc522:
     throw "Self test failed; unknown self-test data: $version $bytes"
 
 /**
+An RFID frame.
+
+Depending on the configuration the frame could be raw (where parity bits must be
+  handled by the caller) or not.
+*/
+class Frame:
+  bytes/ByteArray
+  size_in_bits/int
+
+  /**
+  Constructs a new frame with the given $bytes.
+
+  The $size_in_bits is the number of bits in the frame. It does not need to be a multiple of 8.
+
+  The number of bytes must be at least ($size_in_bits + 7) / 8. In other words, there must be
+    enough bits in the given $bytes array.
+  */
+  constructor .bytes --.size_in_bits=(bytes.size * 8):
+
+  stringify -> string:
+    return "Frame($size_in_bits bits: $bytes)"
+
+/**
+An RFID frame that was received.
+*/
+class ReceivedFrame extends Frame:
+  /** The position of a collision if there was one. */
+  collision_position/int?
+
+  constructor bytes/ByteArray --size_in_bits/int --.collision_position:
+    super bytes --size_in_bits=size_in_bits
+
+/**
 Firmware data for self-tests.
 */
 class SelfTestData:
@@ -864,7 +1012,10 @@ class Card:
   Returns the response from the card.
   */
   transceive bytes/ByteArray --check_crc/bool=false -> ByteArray?:
-    return transceiver_.transceive_standard_ bytes --check_crc=check_crc
+    received_frame := transceiver_.transceive_standard_ bytes --check_crc=check_crc
+    if not received_frame: return null
+    assert: received_frame.size_in_bits = received_frame.bytes.size * 8
+    return received_frame.bytes
 
   halt_ -> none:
     hlta := #[0x50, 0x00]
@@ -1096,7 +1247,6 @@ class MifareCard extends Card:
     halt_
     transceiver_.wake_up_cards_
     transceiver_.select_ uid
-
 
 /**
 Access bits of a Mifare card.

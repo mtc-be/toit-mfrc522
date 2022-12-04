@@ -330,9 +330,9 @@ class MifareCryptoReader:
     into the LFSR.
 
   The $nonce_tag is also used to generate the challenge response; both for
-    the reader, and the tag. See $check_tag_response or $skip_tag_response_check.
+    the reader, and the tag. See $compare_tag_response.
   */
-  generate_challenge_response --nonce_tag/ByteArray --nonce_reader/ByteArray -> ByteArray:
+  generate_challenge_response --nonce_tag/ByteArray --nonce_reader/ByteArray --add_parity_bits/bool=false -> ByteArray:
     if state_ != STATE_0_KEY_INITIALIZED_: throw "Invalid state"
 
     // Feed the UID⊕nonce_tag into the LFSR.
@@ -342,7 +342,7 @@ class MifareCryptoReader:
     if nonce_reader.size != 4: throw "INVALID_NONCE_READER"
 
     // Encrypt the nonce_reader, while feeding it into the LFSR.
-    encrypted_nonce_reader := ByteArray 4: |index|
+    nonce_reader_cipher := ByteArray 4: |index|
       byte := nonce_reader[index]
       8.repeat: | bit_index |
         cipher_bit := crypto1_.cipher_bit --should_shift=false
@@ -362,62 +362,49 @@ class MifareCryptoReader:
     prng.shift 32
     expected_response_tag_ = prng.current_bytes
 
-    crypt --in_place answer_reader --no-check_state
+    answer_reader_cipher := crypt answer_reader --no-check_state
 
-    return encrypted_nonce_reader + answer_reader
+    if not add_parity_bits:
+      return nonce_reader_cipher + answer_reader_cipher
+
+    full_plain := nonce_reader + answer_reader
+    full_cipher := nonce_reader_cipher + answer_reader_cipher
+    return add_parity_
+        --plain=full_plain
+        --cipher=full_cipher
+        --current_crypto_bit=crypto1_.cipher_bit --should_shift=false
 
   /**
-  Checks whether the tag response is correct.
+  Compares the given tag response to the expected one.
+
+  Returns true if the tag response is correct; false otherwise.
 
   This is the last step of the authentication process. The tag is supposed
     to send an encrypted successor of the tag nonce. This method checks
     that the response is correct.
 
-  If $in_place is true, decrypts the response in-place, modifying the
-    $tag_response parameter.
-
   This method changes the internal state so that the $crypt method is available.
   */
-  check_tag_response --in_place/bool tag_response/ByteArray -> none:
-    if not decrypt_and_compare_tag_response_ --in_place=in_place tag_response:
-      throw "INVALID_TAG_RESPONSE"
-    state_ = STATE_3_TAG_RESPONSE_CHECKED_
-
-  /**
-  Skips the tag response check.
-
-  This function still decrypts the tag response (which is necessary to synchronize
-    the LFSR of the reader and the tag), but does not check whether the response
-    is correct.
-
-  This method changes the internal state so that the $crypt method is available.
-  */
-  skip_tag_response_check --in_place/bool tag_response/ByteArray -> none:
-    decrypt_and_compare_tag_response_ --in_place=in_place tag_response
-    state_ = STATE_3_TAG_RESPONSE_CHECKED_
-
-  decrypt_and_compare_tag_response_ --in_place/bool tag_response/ByteArray -> bool:
+  compare_tag_response tag_response/ByteArray -> bool:
     if state_ != STATE2_READER_NONCE_ENCRYPTED_AND_FED_: throw "Invalid state"
     if tag_response.size != 4: throw "Invalid tag response"
     assert: expected_response_tag_ != null
 
-    crypt --in_place=in_place tag_response --no-check_state
+    tag_response = crypt tag_response --no-check_state
 
-    return tag_response == expected_response_tag_
+    result := tag_response == expected_response_tag_
+    state_ = STATE_3_TAG_RESPONSE_CHECKED_
+    return result
 
-  crypt --in_place/bool data/ByteArray --check_state/bool=true -> ByteArray:
+  crypt plain/ByteArray --check_state/bool=true -> ByteArray:
     if check_state and state_ != STATE_3_TAG_RESPONSE_CHECKED_: throw "Invalid state"
 
-    if not in_place: data = data.copy
-
-    data.size.repeat: |index|
-      byte := data[index]
+    return ByteArray plain.size: |index|
+      byte := plain[index]
       8.repeat: | bit_index |
         cipher_bit := crypto1_.cipher_bit
         byte ^= cipher_bit << bit_index
-      data[index] = byte
-
-    return data
+      byte
 
   /**
   Feeds the $uid and $nonce_tag into the LFSR.
@@ -444,6 +431,47 @@ class MifareCryptoReader:
 
     state_ = STATE_1_UID_AND_NONCE_FED_
 
+  /**
+  Adds encrypted parity bits to the $cipher.
+
+  Uses the given $plain text to extract the bits that should be used to crypt.
+  The $current_crypto_bit is the current bit of the LFSR, which is used to
+    encrypt the parity bit of the last byte.
+  */
+  add_parity_ --plain/ByteArray --cipher/ByteArray --current_crypto_bit/int -> ByteArray:
+    total_bits := plain.size * 9  // One parity bit per byte.
+    total_bytes := (total_bits + 7) / 8
+
+    result := ByteArray total_bytes
+
+    target_index := 0
+    target_bit_index := 0
+    last_cipher_bit := current_crypto_bit
+
+    for i := plain.size - 1; i >= 0; i--:
+      byte_plain := plain[i]
+      byte_cipher := cipher[i]
+
+      parity_plain := byte_plain.parity
+      // The parity bit is encrypted with the same bit as the next bit (which we stored
+      // in $last_cipher_bit).
+      parity_cipher := parity_plain ^ last_cipher_bit
+      last_cipher_bit = (byte_plain ^ byte_cipher) & 0x01
+
+      // Put the encrypted parity bit into the correct place in the cipher array.
+      cipher[target_index] |= parity_cipher << target_bit_index
+      target_bit_index--
+      if target_bit_index < 0:
+        target_index--
+        target_bit_index = 7
+
+      // Store the cipher byte right next to it.
+      cipher[target_index] |= byte_cipher >> (7 - target_bit_index)
+      target_index--
+      if target_bit_index != 7:
+        cipher[target_index] |= byte_cipher << (target_bit_index + 1)
+
+    return result
 
 class MifareCryptoWriter:
   /**
@@ -569,19 +597,36 @@ class MifareCryptoWriter:
     crypt --in_place response_tag
     return response_tag
 
-  crypt --in_place/bool data/ByteArray --check_state/bool=true -> ByteArray:
+  crypt --in_place/bool data/ByteArray --check_state/bool=true --add_parity_bits/bool=false -> ByteArray:
+    if in_place and add_parity_bits: throw "in_place and add_parity_bits are mutually exclusive"
     if check_state and state_ != STATE_3_READER_RESPONSE_CHECKED_: throw "Invalid state"
 
-    if not in_place: data = data.copy
+    result /ByteArray := ?
+    if add_parity_bits:
+      result = ByteArray (data.size + 7) / 8
+    else if not in_place:
+      result = data.copy
+    else:
+      result = data
 
+    result_index := 0
+    result_bit_index := 0
     data.size.repeat: |index|
-      byte := data[index]
+      plain_byte := data[index]
+      cipher_byte := plain_byte
       8.repeat: | bit_index |
         cipher_bit := crypto1_.cipher_bit
-        byte ^= cipher_bit << bit_index
-      data[index] = byte
+        cipher_byte ^= cipher_bit << bit_index
+      result[result_index++] = cipher_byte << result_bit_index
+      if add_parity_bits:
+        if result_bit_index != 0:
+          result[result_index] |= cipher_byte >> (8 - result_bit_index)
+        plain_parity := plain_byte.parity
+        cipher_parity := plain_parity ^ (crypto1_.cipher_bit --should_shift=false)
+        result[result_index] |= cipher_parity << result_bit_index
+        result_bit_index = (result_bit_index + 1) % 8
 
-    return data
+    return result
 
 main2:
 //  key := #[ 0xd7, 0x96, 0x86, 0x65, 0xfb, 0x36 ]
@@ -711,12 +756,19 @@ main:
   crypto_reader := MifareCryptoReader key --uid=uid
   crypto_writer := MifareCryptoWriter key --uid=uid
 
+  print "tag_nonce: $n_t"
+
   crypto_writer.start_authentication --tag_nonce=n_t
   reader_response := crypto_reader.generate_challenge_response --nonce_tag=n_t --nonce_reader=n_r
 
+  print "reader_response: $reader_response"
+
   writer_response := crypto_writer.handle_reader_response --in_place reader_response
 
-  crypto_reader.check_tag_response --in_place writer_response
+  print "writer_response: $writer_response"
+
+  succeeded := crypto_reader.compare_tag_response writer_response
+  print "Authentication succeeded: $succeeded"
 
   // Both states are now the same:
   print "Reader state: $(%x crypto_reader.crypto1_.lfsr_state_)"
