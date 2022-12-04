@@ -103,6 +103,8 @@ class Mfrc522:
 
   registers_ /serial.Registers
 
+  current_framing_ /int? := null
+
   crypto_ /MifareCryptoReader? := null
 
   constructor device/serial.Device:
@@ -161,11 +163,6 @@ class Mfrc522:
   transceive_short_ command/int --allow_collision/bool -> ReceivedFrame?:
     if command >= 0x80: throw "INVALID_ARGUMENT"
 
-    // Send only 7 bits of the last (only) byte.
-    set_framing_ --tx_last_bits=7
-
-    //TODO: remove the framing and move it to `transceive`.
-
     frame := Frame #[command] --size_in_bits=7
     return transceive_ frame --allow_collision=allow_collision
 
@@ -187,9 +184,6 @@ class Mfrc522:
     if crypto_:
       bytes = crypto_.crypt bytes
 
-    // Send all 8 bits of the last (only) byte.
-    set_framing_ --tx_last_bits=0
-    // TODO: remove the set_framing_ and move it to the `transceive` function.
     frame := Frame bytes
     return transceive_ frame --check_crc=check_crc
 
@@ -216,15 +210,12 @@ class Mfrc522:
   The response is automatically shifted, so that it would complete the last byte.
   */
   transceive_anticollision_ bytes/ByteArray --last_byte_bits/int -> ReceivedFrame?:
-    // We want to send only 'tx_last_bits' bits. The remaining bits should be ignored.
-    tx_last_bits := (last_byte_bits % 8)
-    // When receiving, the first bit should be shifted by 'rx_align', so that the
-    // combination of the original and the new bits align.
-    rx_align := (last_byte_bits % 8)
-
-    set_framing_ --rx_align=rx_align --tx_last_bits=tx_last_bits
     frame := Frame bytes --size_in_bits=((bytes.size - 1) * 8 + last_byte_bits)
-    return transceive_ frame --allow_collision --shift_response_by=rx_align
+
+    // When receiving, the first bit should be shifted by 'rx_align', so that the
+    // original bytes and the new bits align.
+    shift := (last_byte_bits % 8)
+    return transceive_ frame --allow_collision --shift_response_by=shift
 
   /**
   Sets the framing for future transmissions.
@@ -253,7 +244,13 @@ class Mfrc522:
     // Bit 3: reserved for future use.
     // Bit 2-0: TxLastBits. Used for transmission of bit oriented frames: defines the number of
     //     bits of the last byte that will be transmitted. 0 indicates that all bits should be transmitted.
-    registers_.write_u8 BIT_FRAMING_REGISTER_ ((rx_align << 4) | tx_last_bits)
+    framing_value := (rx_align << 4) | tx_last_bits
+    if framing_value == current_framing_: return
+
+    current_framing_ = null
+    registers_.write_u8 BIT_FRAMING_REGISTER_ framing_value
+    current_framing_ = framing_value
+
 
   /**
   Transmits the given $frame to the card and waits for a response.
@@ -286,6 +283,9 @@ class Mfrc522:
     // Flush the FIFO buffer.
     // "Immediately clears the internal FIFO buffer's read and write pointer and ErrorReg register's BufferOvfl bit."
     registers_.write_u8 FIFO_LEVEL_REGISTER_ 0x80
+
+    // Set the framing.
+    set_framing_ --rx_align=shift_response_by --tx_last_bits=(frame.size_in_bits % 8)
 
     // Write the data into the FIFO.
     registers_.write_bytes FIFO_DATA_REGISTER_ frame.bytes
