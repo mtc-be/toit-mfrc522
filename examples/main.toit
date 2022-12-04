@@ -86,7 +86,8 @@ main:
             else if mifare.uid == IDRAET_UID:
               keys = IDRAET_KEYS
 
-            mifare.write_to_stdout --keys=keys
+            print "uid: $mifare.uid"
+            // mifare.write_to_stdout --keys=keys
 
             // mifare.authenticate --block=3 --is_key_a (keys and keys[0])
             // trailer := mifare.read --block=3

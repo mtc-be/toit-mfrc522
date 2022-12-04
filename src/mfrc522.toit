@@ -158,7 +158,7 @@ class Mfrc522:
 
   See section Iso 14443-3 2008; section 6.2.3.1.
   */
-  transceive_short_ command/int --allow_collision -> ReceivedFrame?:
+  transceive_short_ command/int --allow_collision/bool -> ReceivedFrame?:
     if command >= 0x80: throw "INVALID_ARGUMENT"
 
     // Send only 7 bits of the last (only) byte.
@@ -255,8 +255,22 @@ class Mfrc522:
     //     bits of the last byte that will be transmitted. 0 indicates that all bits should be transmitted.
     registers_.write_u8 BIT_FRAMING_REGISTER_ ((rx_align << 4) | tx_last_bits)
 
+  /**
+  Transmits the given $frame to the card and waits for a response.
+
+  If $allow_collision is false, then throws if a collision is detected. Otherwise, stores
+    the position of the collision in the result. Note that the position of the
+    collision is affected by the $shift_response_by parameter.
+
+  If $check_crc is true then automatically checks the CRC of the response.
+
+  When receiving, the first bit is shifted by $shift_response_by positions. This is used
+    for anticollision frames, where the first bits are shifted to complete the last byte.
+    The synthentic bits are set to 0 and are counted as if sent by the card. As such, the
+    position of the collision is affected by this parameter.
+  */
   transceive_ frame/Frame -> ReceivedFrame?
-      --command/int=COMMAND_TRANSCEIVE_  // Can be 'mfauthenticate'
+      --command/int=COMMAND_TRANSCEIVE_  // Can also be $COMMAND_MFAUTHENT_.
       --allow_collision/bool=false
       --check_crc/bool=false
       --shift_response_by/int=0:
@@ -333,9 +347,30 @@ class Mfrc522:
     detected_collision := error & 0x08 != 0
     if detected_collision and not allow_collision:
       throw RfidException.collision
-    if detected_collision:
+
+    collision_position/int? := ?
+    if not detected_collision:
+      collision_position = null
+    else:
       // Ignore parity errors. They might be caused by the collision.
       error &= ~0x02
+
+      collision_value := registers_.read_u8 COLL_REGISTER_
+
+      // C code clears bits received after a collision.
+      // Don't think we need that.
+      // PCD_ClearRegisterBitMask(CollReg, 0x80);
+      // registers_.write_u8 COLL_REGISTER_ (collision_value & 0x7F)
+
+      has_valid_collision_position := (collision_value & 0x20) == 0
+      if not has_valid_collision_position:
+        // Collision detected, but without any valid position.
+        throw RfidException.internal
+
+      collision_position = collision_value & 0x1F
+      // If the collision position is 0, then the collision happened at bit 32.
+      // See MFRC522 - 9.3.1.15, table 50.
+      if collision_position == 0: collision_position = 32
 
     // For bit 7 and 4 something is writing even though it shouldn't.
     if error & 0x80 != 0 or error & 0x10 != 0: throw RfidException.internal
@@ -354,7 +389,7 @@ class Mfrc522:
     // TODO(florian): read the last-byte bits.
     // Add collision information.
     result_frame :=  ReceivedFrame result_bytes
-        --collision_position=null
+        --collision_position=collision_position
         --size_in_bits=(response_size * 8)
 
     return result_frame
@@ -442,7 +477,6 @@ class Mfrc522:
         response := response_frame.bytes
 
         // The PICC is supposed to complete the UID and add a checksum (BCC).
-        print "response-size: $response.size valid_uid_bytes: $valid_uid_bytes"
         if response.size + valid_uid_bytes != 5:
           throw RfidException.protocol
 
@@ -459,24 +493,13 @@ class Mfrc522:
         while uid_pos < 4:
           uid_buffer[uid_pos++] = response[response_index++]
 
-        error := registers_.read_u8 ERROR_REGISTER_
-        detected_collision := error & 0x08 != 0
+        detected_collision := response_frame.collision_position != null
         if not detected_collision:
           bcc := uid_buffer[0] ^ uid_buffer[1] ^ uid_buffer[2] ^ uid_buffer[3]
           if bcc != response[response_index]: throw RfidException.checksum
           return
 
-        collision_value := registers_.read_u8 COLL_REGISTER_
-        has_valid_collision_position := (collision_value & 0x20) == 0
-        if not has_valid_collision_position:
-          // Collision detected, but without any valid position.
-          // Give up.
-          throw RfidException.internal
-
-        collision_position := collision_value & 0x1F
-        // If the collision position is 0, then the collision happened at bit 32.
-        // See MFRC522 - 9.3.1.15, table 50.
-        if collision_position == 0: collision_position = 32
+        collision_position := response_frame.collision_position
         if collision_position <= known_bits: throw "STATE_ERROR"
         if collision_position + known_bits > 32: throw "STATE_ERROR"
         // Up to the collision position the bits were received correctly.
@@ -565,11 +588,6 @@ class Mfrc522:
 
     // The known bits, including cascade tags, of the UID.
     known_bits := uid.size == 0 ? 0 : uid_buffer.size * 8
-
-    // C code clears bits received after a collision.
-    // Don't think we need that.
-    // PCD_ClearRegisterBitMask(CollReg, 0x80);
-    // registers_.write_u8 COLL_REGISTER_ ((registers_.read_u8 COLL_REGISTER_) & 0x7F)
 
     // Go through the different cascade levels.
     // If the ID is shorter we break out of the loop.
