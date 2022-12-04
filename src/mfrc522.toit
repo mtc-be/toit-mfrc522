@@ -185,7 +185,13 @@ class Mfrc522:
       bytes = crypto_.crypt bytes
 
     frame := Frame bytes
-    return transceive_ frame --check_crc=check_crc
+    result_frame := transceive_ frame
+    if not check_crc: return result_frame
+
+    assert: not result_frame.collision_position
+    assert: result_frame.bytes.size * 8 == result_frame.size_in_bits
+    check_crc_ result_frame.bytes
+    return ReceivedFrame result_frame.bytes[..result_frame.bytes.size - 2]
 
   // /**
   // Transmits the raw bits of $bytes and returns the raw response.
@@ -259,8 +265,6 @@ class Mfrc522:
     the position of the collision in the result. Note that the position of the
     collision is affected by the $shift_response_by parameter.
 
-  If $check_crc is true then automatically checks the CRC of the response.
-
   When receiving, the first bit is shifted by $shift_response_by positions. This is used
     for anticollision frames, where the first bits are shifted to complete the last byte.
     The synthentic bits are set to 0 and are counted as if sent by the card. As such, the
@@ -269,7 +273,6 @@ class Mfrc522:
   transceive_ frame/Frame -> ReceivedFrame?
       --command/int=COMMAND_TRANSCEIVE_  // Can also be $COMMAND_MFAUTHENT_.
       --allow_collision/bool=false
-      --check_crc/bool=false
       --shift_response_by/int=0:
     // The FIFO can handle up to 64 bytes.
     if frame.bytes.size > 64: throw "INVALID_ARGUMENT"
@@ -381,10 +384,6 @@ class Mfrc522:
     response_size := registers_.read_u8 FIFO_LEVEL_REGISTER_
     // We must not use `read_bytes` for SPI. That doesn't yield the correct result.
     result_bytes := ByteArray response_size: registers_.read_u8 FIFO_DATA_REGISTER_
-
-    if check_crc:
-      check_crc_ result_bytes
-      result_bytes = result_bytes[..result_bytes.size - 2]
 
     // TODO(florian): read the last-byte bits.
     // Add collision information.
@@ -892,7 +891,7 @@ class ReceivedFrame extends Frame:
   /** The position of a collision if there was one. */
   collision_position/int?
 
-  constructor bytes/ByteArray --size_in_bits/int --.collision_position:
+  constructor bytes/ByteArray --size_in_bits/int=(bytes.size * 8) --.collision_position=null:
     super bytes --size_in_bits=size_in_bits
 
 /**
