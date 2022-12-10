@@ -83,6 +83,7 @@ class Mfrc522:
   static RX_MODE_REGISTER_ ::= 0x13 << 1
   static TX_CONTROL_REGISTER_ ::= 0x14 << 1
   static TX_ASK_REGISTER_ ::= 0x15 << 1
+  static MF_RX_REGISTER_ ::= 0x1D << 1
   static MOD_WIDTH_REGISTER_ ::= 0x24 << 1
   static T_MODE_REGISTER_ ::= 0x2A << 1
   static T_PRESCALER_REGISTER_ ::= 0x2B << 1
@@ -104,6 +105,7 @@ class Mfrc522:
   registers_ /serial.Registers
 
   current_framing_ /int? := null
+  current_parity_ /int? := null
 
   crypto_ /MifareCryptoReader? := null
 
@@ -257,6 +259,25 @@ class Mfrc522:
     registers_.write_u8 BIT_FRAMING_REGISTER_ framing_value
     current_framing_ = framing_value
 
+  enable_parity_:
+    // Section 9.3.2.14.
+    // Bit 4 disables the generation and checking of parity.
+    value := 0x00
+    if current_parity_ == value: return
+
+    current_parity_ = null
+    registers_.write_u8 MF_RX_REGISTER_ value
+    current_parity_ = value
+
+  disable_parity_:
+    // Section 9.3.2.14.
+    // Bit 4 disables the generation and checking of parity.
+    value := 0x10
+    if current_parity_ == value: return
+
+    current_parity_ = null
+    registers_.write_u8 MF_RX_REGISTER_ value
+    current_parity_ = value
 
   /**
   Transmits the given $frame to the card and waits for a response.
@@ -269,6 +290,10 @@ class Mfrc522:
     for anticollision frames, where the first bits are shifted to complete the last byte.
     The synthentic bits are set to 0 and are counted as if sent by the card. As such, the
     position of the collision is affected by this parameter.
+
+  The $shift_response_by also impacts parity checking. If $shift_response_by is non-zero,
+    the reader expects a parity bit after 8 - $shift_response_by bits. It ignores this
+    bit.
   */
   transceive_ frame/Frame -> ReceivedFrame?
       --command/int=COMMAND_TRANSCEIVE_  // Can also be $COMMAND_MFAUTHENT_.
@@ -276,6 +301,7 @@ class Mfrc522:
       --shift_response_by/int=0:
     // The FIFO can handle up to 64 bytes.
     if frame.bytes.size > 64: throw "INVALID_ARGUMENT"
+
     // Cancel any existing command.
     registers_.write_u8 COMMAND_REGISTER_ COMMAND_IDLE_
 
@@ -386,7 +412,6 @@ class Mfrc522:
     result_bytes := ByteArray response_size: registers_.read_u8 FIFO_DATA_REGISTER_
 
     // TODO(florian): read the last-byte bits.
-    // Add collision information.
     result_frame :=  ReceivedFrame result_bytes
         --collision_position=collision_position
         --size_in_bits=(response_size * 8)
@@ -621,6 +646,7 @@ class Mfrc522:
 
     unreachable
 
+  /*
   is_authenticated_ -> bool:
     // Section 9.3.1.9.
     // Bit 3: MFCrypto1On. Indicates that the MIFARE Crypto1 unit is switched on.
@@ -660,8 +686,8 @@ class Mfrc522:
     // Bit 3: MFCrypto1On. When this bit is cleared then the crypto1 is turned off.
     old := registers_.read_u8 STATUS_2_REGISTER_
     registers_.write_u8 STATUS_2_REGISTER_ (old & ~0x08)
+  */
 
-  /*
   is_authenticated_ -> bool:
     return crypto_ != null
 
@@ -680,16 +706,7 @@ class Mfrc522:
       block,
     ]
 
-    CONTINUE HERE
-    // TODO(florian): we need to disable the automatic parity of the MFRC522.
-    // We need to call `--add_parity_bits` when calling the mifare-authenticator.
-    // The enabling/disabling of the parity should probably be done through a transceive_raw_.
-    // disable: MF_RX_REG = 0x10
-    // enable: MF_RX_REG = 0x00
-
-    print "nonce_tag_frame: $nonce_tag_frame"
     if not nonce_tag_frame:
-      print "no nonce_tag"
       return false
 
     nonce_tag := nonce_tag_frame.bytes
@@ -698,28 +715,40 @@ class Mfrc522:
     crypto_ = null
 
     // In theory this should be a random number.
-    nonce_reader := nonce_tag //  #[ 0x00, 0x00, 0x00, 0x00 ]
+    nonce_reader := #[ 0x00, 0x00, 0x00, 0x00 ]
 
     sleep --ms=10
     new_crypto := MifareCryptoReader key --uid=uid
-    challenge_response := new_crypto.generate_challenge_response
+    challenge_response_plain := new_crypto.generate_challenge_response
         --nonce_tag=nonce_tag
         --nonce_reader=nonce_reader
-    tag_response := transceive_standard_ challenge_response --no-check_crc --no-add_crc
+    challenge_response_cipher := new_crypto.encrypt_challenge_response challenge_response_plain
+    challenge_response_parity := new_crypto.add_parity
+        --plain=challenge_response_plain
+        --cipher=challenge_response_cipher
 
-    if not tag_response:
-      print "no tag response"
+    disable_parity_
+    // Since the challenge_response is 8 bytes long, exactly one byte is added for parity.
+    // This means that all bits of the challenge_response_parity are used.
+    assert: (challenge_response_parity.size * 8 / 9) * 9 == challenge_response_parity.size * 8
+    challenge_frame := Frame challenge_response_parity --size_in_bits=(challenge_response_parity.size * 8)
+    result_frame := transceive_ challenge_frame
+
+    if not result_frame:
+      enable_parity_
       return false
 
-    succeeded := new_crypto.compare_tag_response challenge_response
+    tag_response := result_frame.bytes
+
+    succeeded := new_crypto.compare_tag_response tag_response
 
     if succeeded: crypto_ = new_crypto
+    else: enable_parity_
+
     return succeeded
 
   stop_crypto_:
     crypto_ = null
-
-  */
 
   wake_up_cards_ --only_new/bool=false -> ReceivedFrame?:
     reset_communication_

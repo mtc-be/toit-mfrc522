@@ -92,3 +92,5 @@ https://www.researchgate.net/publication/330603078_A_Comprehensive_Review_of_RFI
 Proxmark source code:
 mfkey: https://github.com/Proxmark/proxmark3/blob/master/tools/mfkey/mfkey32.c
 
+hardnested attack with an MFRC522.
+https://github.com/HakonHystad/MFRC522_nested_attack
