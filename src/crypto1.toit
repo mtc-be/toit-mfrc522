@@ -346,6 +346,58 @@ class MifareCryptoBase_:
         result[target_index] |= byte_cipher << (target_bit_index + 1)
     return result
 
+  /**
+  Given a byte array $bytes with parity bits, fixes them according to the
+    the MiFare encryption.
+
+  The parity bits are taken from the $plain text. They are then encrypted with
+    the same cipher-bit that was used to encrypt the next bit of the $plain text.
+  For the last byte, the cipher-bit is taken from the $current_crypto_bit.
+  */
+  fix_up_parity_bits bytes/ByteArray -> none
+      --plain/ByteArray
+      --cipher/ByteArray
+      --current_crypto_bit/int=(crypto1_.cipher_bit --should_shift=false):
+    if bytes.size == 0: return
+
+    // The first byte of the $cipher and $bytes are the same.
+    // In fact, we don't actually need the $cipher array, as we could
+    // just extract it from the $bytes array.
+    assert: bytes[0] == cipher[0]
+
+    total_bits := plain.size * 9  // One parity bit per byte.
+    total_bytes := (total_bits + 7) / 8
+    assert: bytes.size == total_bytes
+
+    target_index := total_bytes - 1
+    target_bit_index := (total_bits - 1) % 8
+    last_cipher_bit := current_crypto_bit
+
+    for i := plain.size - 1; i >= 0; i--:
+      byte_plain := plain[i]
+      byte_cipher := cipher[i]
+
+      parity_plain := byte_plain.parity ^ 1  // We want odd parity.
+      parity_cipher := byte_cipher.parity ^ 1  // We want odd parity.
+      // The parity bit is encrypted with the same bit as the next bit (which we stored
+      // in $last_cipher_bit).
+      // This is the parity bit that must be stored in the $bytes array.
+      parity_result := parity_plain ^ last_cipher_bit
+
+      last_cipher_bit = (byte_plain ^ byte_cipher) & 0x01
+
+      // Fix the encrypted parity bit in the correct place in the cipher array.
+      // The parity bit is currently $parity_cipher, but it should be $parity_result.
+
+      bytes[target_index] ^= (parity_result ^ parity_cipher) << target_bit_index
+      target_bit_index--
+      if target_bit_index < 0:
+        target_index--
+        target_bit_index = 7
+
+      // Decrement for the cipher byte that is right next to it.
+      target_index--
+
 class MifareCryptoReader extends MifareCryptoBase_:
   /**
   The key has been used to initialize the LFSR.

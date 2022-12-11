@@ -87,7 +87,9 @@ main:
               keys = IDRAET_KEYS
 
             print "uid: $mifare.uid"
+            print "stdout"
             mifare.write_to_stdout --keys=keys
+            print "done"
 
             // mifare.authenticate --block=3 --is_key_a (keys and keys[0])
             // trailer := mifare.read --block=3

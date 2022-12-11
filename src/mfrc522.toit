@@ -19,8 +19,14 @@ class RfidException:
   */
   static NO_RESPONSE ::= 0
 
-  /** A checksum (parity, or CRC) error was detected. */
-  static CHECKSUM ::= 1
+  /** A CRC error was detected. */
+  static CRC ::= 1
+
+  /** A parity error was detected. */
+  static PARITY ::= 2
+
+  /** A checksum error (BCC, block check character) was detected. */
+  static CHECKSUM ::= 3
 
   /**
   A protocol error was detected.
@@ -28,29 +34,31 @@ class RfidException:
   A card responded in an unexpected way. Most often, this is actually caused by
     a communication error; for example, when too many cards are in the field.
   */
-  static PROTOCOL ::= 2
+  static PROTOCOL ::= 4
 
   /** A timeout was detected. */
-  static TIMEOUT_ERROR ::= 3
+  static TIMEOUT_ERROR ::= 5
 
   /** A collision was detected. */
-  static COLLISION ::= 4
+  static COLLISION ::= 6
 
   /**
   An internal error was detected.
 
   If encountered, please file a bug; ideally with a reproducible example.
   */
-  static INTERNAL ::= 5
+  static INTERNAL ::= 7
 
   /**
   The internal temperature sensor detected overheating and shut down the antenna drivers.
   */
-  static TEMPERATURE ::= 6
+  static TEMPERATURE ::= 8
 
   code/int
 
   constructor.no_response: code = NO_RESPONSE
+  constructor.crc:         code = CRC
+  constructor.parity:      code = PARITY
   constructor.checksum:    code = CHECKSUM
   constructor.protocol:    code = PROTOCOL
   constructor.timeout:     code = TIMEOUT_ERROR
@@ -60,7 +68,9 @@ class RfidException:
 
   stringify -> string:
     if code == NO_RESPONSE: return "No response from card"
-    if code == CHECKSUM: return "Checksum error"
+    if code == CRC: return "CRC error"
+    if code == PARITY: return "Parity error"
+    if code == CHECKSUM: return "Checksum error (block check character)"
     if code == PROTOCOL: return "Protocol error"
     if code == TIMEOUT_ERROR: return "Timeout"
     if code == COLLISION: return "Collision"
@@ -166,6 +176,8 @@ class Mfrc522:
     if command >= 0x80: throw "INVALID_ARGUMENT"
 
     frame := Frame #[command] --size_in_bits=7
+    // Since the frame is short, we don't need to worry about enabling or
+    // disabling the parity.
     return transceive_ frame --allow_collision=allow_collision
 
   /**
@@ -179,31 +191,38 @@ class Mfrc522:
   If $crypto_ is not null then uses it to encrypt the data.
   */
   transceive_standard_ bytes/ByteArray --check_crc/bool=false --add_crc/bool=true -> ReceivedFrame?:
+    // For some reason we seem to get a CRC error, while already sending a new frame.
     if add_crc:
       crc := compute_crc_ bytes
       bytes += #[crc & 0xFF, (crc >> 8) & 0xFF]
 
+    result_frame/ReceivedFrame? := ?
     if crypto_:
-      bytes = crypto_.crypt bytes
+      cipher := crypto_.crypt bytes
+      with_parity := insert_parity_bits cipher
+      crypto_.fix_up_parity_bits with_parity --plain=bytes --cipher=cipher
+      frame := Frame with_parity --size_in_bits=(bit_size_of_bytes_with_parity with_parity)
+      disable_parity_
+      result_frame_with_parity := transceive_ frame
+      if not result_frame_with_parity:
+        result_frame = null
+      else:
+        result_bytes_without_parity := remove_parity_bits result_frame_with_parity.bytes --no-check
+        decrypted := crypto_.crypt result_bytes_without_parity
+        result_frame = ReceivedFrame decrypted
+    else:
+      enable_parity_
+      frame := Frame bytes
+      result_frame = transceive_ frame
 
-    frame := Frame bytes
-    result_frame := transceive_ frame
+    if not result_frame: return null
+
     if not check_crc: return result_frame
 
     assert: not result_frame.collision_position
     assert: result_frame.bytes.size * 8 == result_frame.size_in_bits
     check_crc_ result_frame.bytes
     return ReceivedFrame result_frame.bytes[..result_frame.bytes.size - 2]
-
-  // /**
-  // Transmits the raw bits of $bytes and returns the raw response.
-
-  // The reader does *not* add any CRC or parity bits when transceiving. The $bytes
-  //   array must contain these bits. Similarly, the response does contain parity
-  //   bits (if the writer sent them).
-
-  // */
-  // transceive_raw_ bytes/ByteArray --last_byte_bits/int=((bytes.size / 9 * 9) % 8) -> ReceivedFrame?:
 
   /**
   Transmits an anticollision frame and returns the response.
@@ -223,6 +242,7 @@ class Mfrc522:
     // When receiving, the first bit should be shifted by 'rx_align', so that the
     // original bytes and the new bits align.
     shift := (last_byte_bits % 8)
+    enable_parity_
     return transceive_ frame --allow_collision --shift_response_by=shift
 
   /**
@@ -404,7 +424,8 @@ class Mfrc522:
     // For bit 7 and 4 something is writing even though it shouldn't.
     if error & 0x80 != 0 or error & 0x10 != 0: throw RfidException.internal
     if error & 0x40 != 0:                      throw RfidException.temperature
-    if error & 0x04 != 0 or error & 0x02 != 0: throw RfidException.checksum
+    if error & 0x04 != 0:                      throw RfidException.crc
+    if error & 0x02 != 0:                      throw RfidException.parity
     if error & 0x01 != 0:                      throw RfidException.protocol
 
     response_size := registers_.read_u8 FIFO_LEVEL_REGISTER_
@@ -442,7 +463,7 @@ class Mfrc522:
     if data.size < 3: throw RfidException.protocol
     crc := compute_crc_ data[..data.size - 2]
     if crc & 0xFF != data[data.size - 2] or crc >> 8 != data[data.size - 1]:
-      throw RfidException.checksum
+      throw RfidException.crc
 
   /**
   Executes an anticollision to get the UID of a PICC in the field.
@@ -645,8 +666,7 @@ class Mfrc522:
       return Card this uid sak[0]
 
     unreachable
-
-  /*
+/*
   is_authenticated_ -> bool:
     // Section 9.3.1.9.
     // Bit 3: MFCrypto1On. Indicates that the MIFARE Crypto1 unit is switched on.
@@ -686,7 +706,68 @@ class Mfrc522:
     // Bit 3: MFCrypto1On. When this bit is cleared then the crypto1 is turned off.
     old := registers_.read_u8 STATUS_2_REGISTER_
     registers_.write_u8 STATUS_2_REGISTER_ (old & ~0x08)
+*/
+  /**
+  Inserts odd parity bits into the given $bytes.
+
+  The result is a byte array that has an additional parity bit for each byte.
+  The valid bits of the result can be computed with $bit_size_of_bytes_with_parity.
   */
+  insert_parity_bits bytes/ByteArray -> ByteArray:
+    if bytes.size == 0: throw "INVALID_ARGUMENT"
+
+    // Add one parity bit per byte.
+    result := ByteArray (bytes.size + (bytes.size + 7) / 8)
+    target_index := 0
+    target_bit_index := 0
+    for i := 0; i < bytes.size; i++:
+      byte := bytes[i]
+      parity := byte.parity ^ 1  // Odd parity.
+      result[target_index] |= byte << target_bit_index
+      target_index++
+      if target_bit_index != 0:
+        result[target_index] |= byte >> (8 - target_bit_index)
+      result[target_index] |= parity << target_bit_index
+      target_bit_index++
+      if target_bit_index == 8:
+        target_bit_index = 0
+        target_index++
+    return result
+
+  bit_size_of_bytes_with_parity bytes/ByteArray -> int:
+    return (bytes.size * 8 / 9) * 9
+
+  /**
+  Removes the parity bits from the given $bytes.
+
+  The result is a byte array that has one less bit for each byte.
+
+  If $check is true then the parity bits are checked and an exception is thrown if they are not
+    correct.
+  */
+  remove_parity_bits bytes/ByteArray --check/bool=true -> ByteArray:
+    result := ByteArray (bytes.size * 8 / 9)
+    source_index := 0
+    source_bit_index := 0
+
+    for i := 0; i < result.size; i++:
+      byte := bytes[source_index] >> source_bit_index
+      source_index++
+      if source_bit_index != 0:
+        byte |= bytes[source_index] << (8 - source_bit_index)
+        byte &= 0xFF
+      parity_bit := (bytes[source_index] >> source_bit_index) & 1
+      source_bit_index++
+      if source_bit_index == 8:
+        source_index++
+        source_bit_index = 0
+
+      if check:
+        parity := byte.parity ^ 1  // Odd parity.
+        if parity != parity_bit: throw RfidException.parity
+
+      result[i] = byte
+    return result
 
   is_authenticated_ -> bool:
     return crypto_ != null
@@ -739,8 +820,9 @@ class Mfrc522:
       return false
 
     tag_response := result_frame.bytes
+    tag_response_without_parity := remove_parity_bits tag_response --no-check
 
-    succeeded := new_crypto.compare_tag_response tag_response
+    succeeded := new_crypto.compare_tag_response tag_response_without_parity
 
     if succeeded: crypto_ = new_crypto
     else: enable_parity_
