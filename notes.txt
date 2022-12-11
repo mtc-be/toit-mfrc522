@@ -94,3 +94,9 @@ mfkey: https://github.com/Proxmark/proxmark3/blob/master/tools/mfkey/mfkey32.c
 
 hardnested attack with an MFRC522.
 https://github.com/HakonHystad/MFRC522_nested_attack
+
+List of attacks.
+Seems to have a link to recover the key from reader.
+http://www.cs.ru.nl/~rverdult/Ciphertext-only_Cryptanalysis_on_Hardened_Mifare_Classic_Cards-CCS_2015.pdf
+Reader attack is the LFSR Rollback of Dismantling Mifare; Section 6.2 of
+https://www.cs.bham.ac.uk/~garciaf/publications/Dismantling.Mifare.pdf

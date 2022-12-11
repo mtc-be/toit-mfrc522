@@ -782,6 +782,9 @@ class Mfrc522:
     AUTHENT_KEY_A_COMMAND ::= 0x60
     AUTHENT_KEY_B_COMMAND ::= 0x61
 
+    TODO(florian): apparently we need to decrypt the nonce tag with the new
+    crypto1. Currently it's encrypted with the old one.
+
     nonce_tag_frame := transceive_standard_ --no-check_crc #[
       is_key_a ? AUTHENT_KEY_A_COMMAND : AUTHENT_KEY_B_COMMAND,
       block,
