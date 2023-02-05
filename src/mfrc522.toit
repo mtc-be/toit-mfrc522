@@ -190,7 +190,7 @@ class Mfrc522:
 
   If $crypto_ is not null then uses it to encrypt the data.
   */
-  transceive_standard_ bytes/ByteArray --check_crc/bool=false --add_crc/bool=true --switch_crypto/MifareCryptoReader?=null -> ReceivedFrame?:
+  transceive_standard_ bytes/ByteArray --check_crc/bool=false --add_crc/bool=true -> ReceivedFrame?:
     // For some reason we seem to get a CRC error, while already sending a new frame.
     if add_crc:
       crc := compute_crc_ bytes
@@ -198,18 +198,17 @@ class Mfrc522:
 
     result_frame/ReceivedFrame? := ?
     if crypto_:
-      cipher := crypto_.crypt bytes
-      with_parity := insert_parity_bits cipher
-      crypto_.fix_up_parity_bits with_parity --plain=bytes --cipher=cipher
+      ciphertext := crypto_.encrypt bytes
+      with_parity := insert_parity_bits ciphertext
+      crypto_.fix_up_parity_bits with_parity --plain=bytes --cipher=ciphertext
       frame := Frame with_parity --size_in_bits=(bit_size_of_bytes_with_parity with_parity)
       disable_parity_
       result_frame_with_parity := transceive_ frame
-      crypto := switch_crypto or crypto_
       if not result_frame_with_parity:
         result_frame = null
       else:
         result_bytes_without_parity := remove_parity_bits result_frame_with_parity.bytes --no-check
-        decrypted := crypto.crypt result_bytes_without_parity --no-check_state
+        decrypted := crypto_.decrypt result_bytes_without_parity
         result_frame = ReceivedFrame decrypted
     else:
       enable_parity_
@@ -774,66 +773,64 @@ class Mfrc522:
     return crypto_ != null
 
   authenticate_ --block/int --key/ByteArray --uid/ByteArray --is_key_a/bool -> bool:
-    if uid.size != 4 and uid.size != 7 and uid.size != 10: throw "INVALID_ARGUMENT"
-    if key.size != 6: throw "INVALID_ARGUMENT"
+    successful := false
+    try:
+      if uid.size != 4 and uid.size != 7 and uid.size != 10: throw "INVALID_ARGUMENT"
+      if key.size != 6: throw "INVALID_ARGUMENT"
 
-    // See MIFARE Classic EV1 1K spec.
-    // https://www.nxp.com/docs/en/data-sheet/MF1S50YYX_V1.pdf
-    // Section 9.1.
-    AUTHENT_KEY_A_COMMAND ::= 0x60
-    AUTHENT_KEY_B_COMMAND ::= 0x61
+      // See MIFARE Classic EV1 1K spec.
+      // https://www.nxp.com/docs/en/data-sheet/MF1S50YYX_V1.pdf
+      // Section 9.1.
+      AUTHENT_KEY_A_COMMAND ::= 0x60
+      AUTHENT_KEY_B_COMMAND ::= 0x61
 
-    // TODO(florian): apparently we need to decrypt the nonce tag with the new
-    // crypto1. Currently it's encrypted with the old one.
-    // See crypto1.toit main: the last examples there are decoded correctly.
+      // TODO(florian): apparently we need to decrypt the nonce tag with the new
+      // crypto1. Currently it's encrypted with the old one.
+      // See crypto1.toit main: the last examples there are decoded correctly.
 
-    is_nested := crypto_ != null
+      is_nested := crypto_ != null
 
-    new_crypto := MifareCryptoReader key --uid=uid
+      if not crypto_:
+        crypto_ = MifareCryptoReader --uid=uid
 
-    nonce_tag_frame := transceive_standard_ --no-check_crc
-        --switch_crypto= is_nested ? new_crypto : null
-        #[
-          is_key_a ? AUTHENT_KEY_A_COMMAND : AUTHENT_KEY_B_COMMAND,
-          block,
-        ]
+      crypto_.start_authentication --key=key
 
-    if not nonce_tag_frame:
-      print "no nonce tag"
-      return false
+      nonce_tag_frame := transceive_standard_ --no-check_crc #[
+            is_key_a ? AUTHENT_KEY_A_COMMAND : AUTHENT_KEY_B_COMMAND,
+            block,
+          ]
 
-    nonce_tag := nonce_tag_frame.bytes
+      if not nonce_tag_frame:
+        print "no nonce tag"
+        return false
 
-    crypto_ = new_crypto
+      nonce_tag := nonce_tag_frame.bytes
 
-    // In theory this should be a random number.
-    nonce_reader := #[ 0x00, 0x00, 0x00, 0x00 ]
+      // In theory this should be a random number.
+      nonce_reader := #[ 0x00, 0x00, 0x00, 0x00 ]
 
-    sleep --ms=10
-    challenge_response_plain := new_crypto.generate_challenge_response
-        --nonce_tag=nonce_tag
-        --nonce_reader=nonce_reader
-    challenge_response_cipher := new_crypto.encrypt_challenge_response challenge_response_plain
-    challenge_response_parity := new_crypto.add_parity
-        --plain=challenge_response_plain
-        --cipher=challenge_response_cipher
+      sleep --ms=10
+      challenge_response := crypto_.generate_challenge_response
+          --nonce_tag=nonce_tag
+          --nonce_reader=nonce_reader
 
-    disable_parity_
-    // Since the challenge_response is 8 bytes long, exactly one byte is added for parity.
-    // This means that all bits of the challenge_response_parity are used.
-    assert: (challenge_response_parity.size * 8 / 9) * 9 == challenge_response_parity.size * 8
-    challenge_frame := Frame challenge_response_parity --size_in_bits=(challenge_response_parity.size * 8)
-    result_frame := transceive_ challenge_frame
+      tag_response_frame := transceive_standard_
+          --no-add_crc
+          --no-check_crc
+          challenge_response
 
-    if not result_frame:
-      enable_parity_
-      print "no result frame"
-      return false
+      if not tag_response_frame:
+        print "no tag response frame"
+        return false
 
-    tag_response := result_frame.bytes
-    tag_response_without_parity := remove_parity_bits tag_response --no-check
-
-    return new_crypto.compare_tag_response tag_response_without_parity
+      successful = crypto_.compare_tag_response tag_response_frame.bytes
+      return successful
+    finally:
+      // Make sure we don't leave the crypto in a bad state.
+      // If we are not successful, then the communication is pretty much
+      // broken anyway.
+      if not successful:
+        crypto_ = null
 
   stop_crypto_:
     crypto_ = null
