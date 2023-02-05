@@ -327,25 +327,6 @@ class MifareCryptoBase_:
       byte
 
   /**
-  Temporary function for nested authentication.
-
-  The $plain text is probably the nonce token.
-  */
-  crypt2 plain/ByteArray uid/ByteArray -> ByteArray:
-    xored := ByteArray 4: uid[it] ^ plain[it]
-
-    xored_value := LITTLE_ENDIAN.uint32 xored 0
-
-    return ByteArray plain.size: |index|
-      byte := plain[index]
-      8.repeat: | bit_index |
-        cipher_bit := crypto1_.cipher_bit --should_shift=false
-        byte ^= cipher_bit << bit_index
-        crypto1_.shift xored_value & 1
-        xored_value >>= 1
-      byte
-
-  /**
   Adds encrypted parity bits to the $cipher.
 
   Uses the given $plain text to extract the bits that should be used to crypt.
@@ -650,7 +631,9 @@ class MifareCryptoReader extends MifareCryptoBase_:
         8.repeat: | bit_index |
           cipher_bit := crypto1_.cipher_bit --should_shift=false
           byte ^= cipher_bit << bit_index
-          crypto1_.shift xored_value & 1
+          // The xored_value was created with the crypted nonce.
+          // Decrypt it before feeding it into the LFSR.
+          crypto1_.shift ((xored_value & 1) ^ cipher_bit)
           xored_value >>= 1
         byte
     else:
@@ -907,16 +890,3 @@ main:
   crypto_reader.start_authentication --key=key
   print (crypto_reader.encrypt #[0x60, 0x01])  // Authentication command.
   print (crypto_reader.decrypt #[0x23, 0x23, 0x6E, 0xF4])
-
-  crypto_reader.state_ = MifareCryptoReader.STATE_AUTHENTICATED_
-  print (crypto_reader.encrypt #[0x60, 0x01])  // Authentication command.
-  print (crypto_reader.decrypt #[0xDC, 0xFC, 0x96, 0x2B])
-
-  // crypto_reader2 := MifareCryptoReader key --uid=uid
-  // tt := crypto_reader2.crypt2 #[0x8F, 0x82, 0x69, 0x9E] uid
-  // print tt
-
-  // // A nested authentication
-  // crypto_reader2 = MifareCryptoReader key --uid=uid
-  // tt = crypto_reader2.crypt2 #[0xDC, 0xFC, 0x96, 0x2B] uid
-  // print tt

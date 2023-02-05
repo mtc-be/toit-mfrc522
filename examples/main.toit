@@ -87,7 +87,6 @@ main:
               keys = IDRAET_KEYS
 
             print "uid: $mifare.uid"
-            print "stdout"
             mifare.write_to_stdout --keys=keys
             print "done"
 
