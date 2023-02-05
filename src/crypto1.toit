@@ -294,12 +294,36 @@ class MifareCryptoBase_:
   constructor key/ByteArray:
     crypto1_ = Crypto1 --key=key
 
+  /**
+  Encrypts the given $plain text using the current state of the $crypto1_.
+
+  This function can be used once the initial authentication has been completed.
+  */
   crypt plain/ByteArray -> ByteArray:
     return ByteArray plain.size: |index|
       byte := plain[index]
       8.repeat: | bit_index |
         cipher_bit := crypto1_.cipher_bit
         byte ^= cipher_bit << bit_index
+      byte
+
+  /**
+  Temporary function for nested authentication.
+
+  The $plain text is probably the nonce token.
+  */
+  crypt2 plain/ByteArray uid/ByteArray -> ByteArray:
+    xored := ByteArray 4: uid[it] ^ plain[it]
+
+    xored_value := LITTLE_ENDIAN.uint32 xored 0
+
+    return ByteArray plain.size: |index|
+      byte := plain[index]
+      8.repeat: | bit_index |
+        cipher_bit := crypto1_.cipher_bit --should_shift=false
+        byte ^= cipher_bit << bit_index
+        crypto1_.shift xored_value & 1
+        xored_value >>= 1
       byte
 
   /**
@@ -734,3 +758,12 @@ main:
   // Both states are now the same:
   print "Reader state: $(%x crypto_reader.crypto1_.lfsr_state_)"
   print "Tag state:    $(%x crypto_writer.crypto1_.lfsr_state_)"
+
+  crypto_reader2 := MifareCryptoReader key --uid=uid
+  tt := crypto_reader2.crypt2 #[0x8F, 0x82, 0x69, 0x9E] uid
+  print tt
+
+  // A nested authentication
+  crypto_reader2 = MifareCryptoReader key --uid=uid
+  tt = crypto_reader2.crypt2 #[0xDC, 0xFC, 0x96, 0x2B] uid
+  print tt

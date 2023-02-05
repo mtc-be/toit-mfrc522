@@ -190,7 +190,7 @@ class Mfrc522:
 
   If $crypto_ is not null then uses it to encrypt the data.
   */
-  transceive_standard_ bytes/ByteArray --check_crc/bool=false --add_crc/bool=true -> ReceivedFrame?:
+  transceive_standard_ bytes/ByteArray --check_crc/bool=false --add_crc/bool=true --switch_crypto/MifareCryptoReader?=null -> ReceivedFrame?:
     // For some reason we seem to get a CRC error, while already sending a new frame.
     if add_crc:
       crc := compute_crc_ bytes
@@ -204,11 +204,12 @@ class Mfrc522:
       frame := Frame with_parity --size_in_bits=(bit_size_of_bytes_with_parity with_parity)
       disable_parity_
       result_frame_with_parity := transceive_ frame
+      crypto := switch_crypto or crypto_
       if not result_frame_with_parity:
         result_frame = null
       else:
         result_bytes_without_parity := remove_parity_bits result_frame_with_parity.bytes --no-check
-        decrypted := crypto_.crypt result_bytes_without_parity
+        decrypted := crypto.crypt result_bytes_without_parity --no-check_state
         result_frame = ReceivedFrame decrypted
     else:
       enable_parity_
@@ -782,27 +783,33 @@ class Mfrc522:
     AUTHENT_KEY_A_COMMAND ::= 0x60
     AUTHENT_KEY_B_COMMAND ::= 0x61
 
-    TODO(florian): apparently we need to decrypt the nonce tag with the new
-    crypto1. Currently it's encrypted with the old one.
+    // TODO(florian): apparently we need to decrypt the nonce tag with the new
+    // crypto1. Currently it's encrypted with the old one.
+    // See crypto1.toit main: the last examples there are decoded correctly.
 
-    nonce_tag_frame := transceive_standard_ --no-check_crc #[
-      is_key_a ? AUTHENT_KEY_A_COMMAND : AUTHENT_KEY_B_COMMAND,
-      block,
-    ]
+    is_nested := crypto_ != null
+
+    new_crypto := MifareCryptoReader key --uid=uid
+
+    nonce_tag_frame := transceive_standard_ --no-check_crc
+        --switch_crypto= is_nested ? new_crypto : null
+        #[
+          is_key_a ? AUTHENT_KEY_A_COMMAND : AUTHENT_KEY_B_COMMAND,
+          block,
+        ]
 
     if not nonce_tag_frame:
+      print "no nonce tag"
       return false
 
     nonce_tag := nonce_tag_frame.bytes
 
-    // If there was already a crypto1 session, drop it now.
-    crypto_ = null
+    crypto_ = new_crypto
 
     // In theory this should be a random number.
     nonce_reader := #[ 0x00, 0x00, 0x00, 0x00 ]
 
     sleep --ms=10
-    new_crypto := MifareCryptoReader key --uid=uid
     challenge_response_plain := new_crypto.generate_challenge_response
         --nonce_tag=nonce_tag
         --nonce_reader=nonce_reader
@@ -820,17 +827,13 @@ class Mfrc522:
 
     if not result_frame:
       enable_parity_
+      print "no result frame"
       return false
 
     tag_response := result_frame.bytes
     tag_response_without_parity := remove_parity_bits tag_response --no-check
 
-    succeeded := new_crypto.compare_tag_response tag_response_without_parity
-
-    if succeeded: crypto_ = new_crypto
-    else: enable_parity_
-
-    return succeeded
+    return new_crypto.compare_tag_response tag_response_without_parity
 
   stop_crypto_:
     crypto_ = null
@@ -1146,7 +1149,7 @@ class Card:
   transceive bytes/ByteArray --check_crc/bool=false -> ByteArray?:
     received_frame := transceiver_.transceive_standard_ bytes --check_crc=check_crc
     if not received_frame: return null
-    assert: received_frame.size_in_bits = received_frame.bytes.size * 8
+    assert: received_frame.size_in_bits == received_frame.bytes.size * 8
     return received_frame.bytes
 
   halt_ -> none:
