@@ -216,32 +216,93 @@ class Crypto1:
     lfsr_state_ = ((lfsr_state_ << 1) | new_bit) & MASK
 
   /**
+  Shifts $bit_count new bits into the LFSR, xoring them with the
+    $input_bits (least significant bits first) first.
+  */
+  shift input_bits/int --bit_count/int:
+    bit_count.repeat:
+      shift input_bits & 1
+      input_bits >>= 1
+
+  /**
   Returns the current cipher bit.
 
   This function is commonly referred to as "filter" function.
   */
   cipher_bit --should_shift/bool=true:
-    v1 := f_b (bit_ 9) (bit_ 11) (bit_ 13) (bit_ 15)
-    v2 := f_a (bit_ 17) (bit_ 19) (bit_ 21) (bit_ 23)
-    v3 := f_a (bit_ 25) (bit_ 27) (bit_ 29) (bit_ 31)
-    v4 := f_b (bit_ 33) (bit_ 35) (bit_ 37) (bit_ 39)
-    v5 := f_a (bit_ 41) (bit_ 43) (bit_ 45) (bit_ 47)
-    result := f_c v1 v2 v3 v4 v5
+    v1 := f_b_ (bit_ 9) (bit_ 11) (bit_ 13) (bit_ 15)
+    v2 := f_a_ (bit_ 17) (bit_ 19) (bit_ 21) (bit_ 23)
+    v3 := f_a_ (bit_ 25) (bit_ 27) (bit_ 29) (bit_ 31)
+    v4 := f_b_ (bit_ 33) (bit_ 35) (bit_ 37) (bit_ 39)
+    v5 := f_a_ (bit_ 41) (bit_ 43) (bit_ 45) (bit_ 47)
+    result := f_c_ v1 v2 v3 v4 v5
     if should_shift: shift
     return result
+
+  /**
+  En/decrypts the given plain/cipher $text using the current state.
+  */
+  crypt text/ByteArray -> ByteArray:
+    return ByteArray text.size: |index|
+      byte := text[index]
+      8.repeat: | bit_index |
+        cipher_bit := cipher_bit
+        byte ^= cipher_bit << bit_index
+      byte
+
+  /**
+  En/decrypts the given plain/cipher $text while feeding in the
+    $feed_crypted value that is xored with the same cipher bit as the
+    $text.
+
+  Each text-bit is xored with the cipher bit first, and then a bit
+    (lowest significant bits first) of the $feed_crypted is xored with
+    with the same cipher bit and shifted into the LFSR.
+
+  The $text is not used to shift the LFSR.
+  */
+  crypt text/ByteArray --feed_crypted/int -> ByteArray:
+    return ByteArray text.size: |index|
+      byte := text[index]
+      8.repeat: | bit_index |
+        cipher_bit := cipher_bit --should_shift=false
+        byte ^= cipher_bit << bit_index
+        shift ((feed_crypted & 1) ^ cipher_bit)
+        feed_crypted >>= 1
+      byte
+
+  /**
+  En/decrypts the given plain/cipher $text while feeding in the
+    $feed_plain value.
+
+  Each text-bit is xored with the cipher bit first, and then a bit
+    (lowest significant bits first) of the $feed_plain is shifted
+    into the LFSR.
+
+  The $text is not used to shift the LFSR.
+  */
+  crypt text/ByteArray --feed_plain/int -> ByteArray:
+    return ByteArray text.size: |index|
+      byte := text[index]
+      8.repeat: | bit_index |
+        cipher_bit := cipher_bit --should_shift=false
+        byte ^= cipher_bit << bit_index
+        shift (feed_plain & 1)
+        feed_plain >>= 1
+      byte
 
   bit_ n/int:
     return (lfsr_state_ >> (47 - n)) & 1
 
-  f_a y0/int y1/int y2/int y3/int:
+  f_a_ y0/int y1/int y2/int y3/int:
     bit_index := (y3 << 3) + (y2 << 2) + (y1 << 1) + y0
     return (0x9E98 >> bit_index) & 1
 
-  f_b y3/int y2/int y1/int y0/int:
+  f_b_ y3/int y2/int y1/int y0/int:
     bit_index := (y0 << 3) + (y1 << 2) + (y2 << 1) + y3
     return (0xB48E >> bit_index) & 1
 
-  f_c y4/int y3/int y2/int y1/int y0/int:
+  f_c_ y4/int y3/int y2/int y1/int y0/int:
     bit_index := (y0 << 4) + (y1 << 3) + (y2 << 2) + (y3 << 1) + y4
     return (0xEC57E80A >> bit_index) & 1
 
@@ -310,22 +371,15 @@ class MifareCryptoBase_:
   /**
   Sets the internal state of the crypto1 LFSR to the given $key.
   */
-  set_key key/ByteArray:
+  set_key_ key/ByteArray:
     if key.size != 6: throw "Invalid key size"
     crypto1_.set_key key
 
   /**
-  Encrypts the given $plain text using the current state of the $crypto1_.
-
-  This function can be used once the initial authentication has been completed.
+  En/decrypts the given plain/cipher $text using the current state of the $crypto1_.
   */
-  crypt_ plain/ByteArray -> ByteArray:
-    return ByteArray plain.size: |index|
-      byte := plain[index]
-      8.repeat: | bit_index |
-        cipher_bit := crypto1_.cipher_bit
-        byte ^= cipher_bit << bit_index
-      byte
+  crypt_ text/ByteArray -> ByteArray:
+    return crypto1_.crypt text
 
   /**
   Adds encrypted parity bits to the $cipher.
@@ -565,7 +619,7 @@ class MifareCryptoReader extends MifareCryptoBase_:
     if state_ == STATE_WAITING_FOR_NONCE_TAG_ or
         state_ == STATE_WAITING_FOR_NESTED_NONCE_TAG_:
       is_nested := state_ == STATE_WAITING_FOR_NESTED_NONCE_TAG_
-      set_key new_key_
+      set_key_ new_key_
       new_key_ = null
       state_ = STATE_KEY_INITIALIZED_
       return decrypt_nonce_tag_
@@ -633,21 +687,10 @@ class MifareCryptoReader extends MifareCryptoBase_:
 
     result/ByteArray := ?
     if nested:
-      result = ByteArray nonce_tag.size: |index|
-        byte := nonce_tag[index]
-        8.repeat: | bit_index |
-          cipher_bit := crypto1_.cipher_bit --should_shift=false
-          byte ^= cipher_bit << bit_index
-          // The xored_value was created with the crypted nonce.
-          // Decrypt it before feeding it into the LFSR.
-          crypto1_.shift ((xored_value & 1) ^ cipher_bit)
-          xored_value >>= 1
-        byte
+      result = crypto1_.crypt nonce_tag --feed_crypted=xored_value
     else:
       // Simply feed the UID and nonce_tag into the LFSR.
-      32.repeat:
-        crypto1_.shift xored_value & 1
-        xored_value >>= 1
+      crypto1_.shift xored_value --bit_count=32
       result = nonce_tag
 
     state_ = STATE_UID_AND_NONCE_FED_
@@ -663,22 +706,17 @@ class MifareCryptoReader extends MifareCryptoBase_:
     if state_ != STATE_UID_AND_NONCE_FED_: throw "Invalid state"
     if challenge_response.size != 8: throw "Invalid challenge response"
 
+    nonce_reader := challenge_response[0..4]
     // Encrypt the nonce_reader, while feeding it into the LFSR.
-    nonce_reader_cipher := ByteArray 4: |index|
-      byte := challenge_response[index]
-      8.repeat: | bit_index |
-        cipher_bit := crypto1_.cipher_bit --should_shift=false
-        plain_bit := (byte >> bit_index) & 1
-        byte ^= cipher_bit << bit_index
-        crypto1_.shift plain_bit
-      byte
+    plain_bits := LITTLE_ENDIAN.uint32 nonce_reader 0
+    nonce_reader_ciphertext := crypto1_.crypt nonce_reader --feed_plain=plain_bits
 
     state_ = STATE_READER_NONCE_ENCRYPTED_AND_FED_
 
     answer_reader := challenge_response[4..]
-    answer_reader_cipher := crypt_ answer_reader
+    answer_reader_ciphertext := crypt_ answer_reader
 
-    return nonce_reader_cipher + answer_reader_cipher
+    return nonce_reader_ciphertext + answer_reader_ciphertext
 
 class MifareCryptoWriter extends MifareCryptoBase_:
   /**
@@ -756,7 +794,7 @@ class MifareCryptoWriter extends MifareCryptoBase_:
   start_authentication --key/ByteArray:
     if state_ != STATE_CONSTRUCTED_ and state_ != STATE_AUTHENTICATED_:
       throw "INVALID_STATE"
-    set_key key
+    set_key_ key
     if state_ == STATE_CONSTRUCTED_:
       state_ = STATE_WAITING_FOR_NONCE_TAG_
     else:
@@ -844,19 +882,9 @@ class MifareCryptoWriter extends MifareCryptoBase_:
 
     result/ByteArray := ?
     if nested:
-      result = ByteArray 4: |index|
-        byte := nonce_tag[index]
-        8.repeat: | bit_index |
-          cipher_bit := crypto1_.cipher_bit --should_shift=false
-          byte ^= cipher_bit << bit_index
-          crypto1_.shift xored_value & 1
-          xored_value >>= 1
-        byte
+      result = crypto1_.crypt nonce_tag --feed_plain=xored_value
     else:
-      32.repeat:
-        crypto1_.shift xored_value & 1
-        xored_value >>= 1
-
+      crypto1_.shift xored_value --bit_count=32
       result = nonce_tag
 
     state_ = STATE_WAITING_FOR_CHALLENGE_RESPONSE_
@@ -870,14 +898,8 @@ class MifareCryptoWriter extends MifareCryptoBase_:
     encrypted_challenge_response := response[4..8]
 
     // Decrypt the reader nonce, while feeding it into the LFSR.
-    nonce_reader := ByteArray 4: |index|
-      byte := encrypted_nonce_reader[index]
-      8.repeat: | bit_index |
-        cipher_bit := crypto1_.cipher_bit --should_shift=false
-        byte ^= cipher_bit << bit_index
-        plain_bit := (byte >> bit_index) & 1
-        crypto1_.shift plain_bit
-      byte
+    encryped_bits := LITTLE_ENDIAN.uint32 encrypted_nonce_reader 0
+    nonce_reader := crypto1_.crypt encrypted_nonce_reader --feed_crypted=encryped_bits
 
     state_ = STATE_WAITING_FOR_FINAL_MESSAGE_REQUEST_
 
