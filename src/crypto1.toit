@@ -191,6 +191,37 @@ class Crypto1:
     set_key key
 
   /**
+  The current LFSR state.
+
+  The bit order is such that new bits are shifted in from the right.
+    That is, a shifted bit takes the position of the least significant bit.
+
+  The Crypto-1 LFSR has 48 bits.
+  */
+  state -> int:
+    return lfsr_state_
+
+  /**
+  Returns the current LFSR state as a byte array.
+
+  The least-significant bit of the least-significant (first) byte
+    is the most-significant bit of the state.
+  The most-significant bit of the most-significant (last) byte
+    is the least-significant bit of the state.
+  */
+  state --as_bytes -> ByteArray:
+    current_state := lfsr_state_
+    inverted := 0
+    48.repeat:
+      inverted <<= 1
+      inverted += current_state & 1
+      current_state >>= 1
+    result := ByteArray 6
+    LITTLE_ENDIAN.put_uint32 result 0 (inverted & 0xffffffff)
+    LITTLE_ENDIAN.put_uint16 result 4 (inverted >> 32)
+    return result
+
+  /**
   Sets the LFSR state to the given $key.
   */
   set_key key/ByteArray:
@@ -241,6 +272,9 @@ class Crypto1:
 
   /**
   En/decrypts the given plain/cipher $text using the current state.
+
+  Crypts the $text by xoring each bit with the cipher bit, starting
+    with the least significant bit of the first byte.
   */
   crypt text/ByteArray -> ByteArray:
     return ByteArray text.size: |index|
@@ -324,28 +358,45 @@ class Crypto1Prng:
   constructor --seed_bytes/ByteArray:
     set_state --bytes=seed_bytes
 
-  set_state state/int:
-    lfsr_state_ = invert_ state
-
-  set_state --bytes/ByteArray:
-    set_state (LITTLE_ENDIAN.uint32 bytes 0)
-
   /**
-  Returns the current state.
+  The current state of the LFSR.
 
-  Before returning shifts 32 times (but returns the old value).
+  The bit order is such that new bits are shifted in from the right.
+    That is, a shifted bit takes the position of the least significant bit.
+
+  The LFSR has 32 bits.
   */
-  current -> int:
-    result := invert_ lfsr_state_
-    return result
+  state -> int:
+    return lfsr_state_
 
   /**
   Returns the current state as a 4-byte array.
+
+  The least-significant bit of the least-significant (first) byte
+    is the most-significant bit of the state.
+  The most-significant bit of the most-significant (last) byte
+    is the least-significant bit of the state.
   */
-  current_bytes -> ByteArray:
+  state --as_bytes/bool -> ByteArray:
+    if not as_bytes: throw "INVALID_ARGUMENT"
     result := ByteArray 4
-    LITTLE_ENDIAN.put_uint32 result 0 current
+    LITTLE_ENDIAN.put_uint32 result 0 (invert_ lfsr_state_)
     return result
+
+  /**
+  Sets the current state of the LFSR.
+  */
+  set_state state/int:
+    lfsr_state_ = state
+
+  /**
+  Sets the current state of the LFSR given a 4-byte array.
+
+  The least-significant bit of the least-significant (first) byte
+    becomes the most-significant bit of the state.
+  */
+  set_state --bytes/ByteArray:
+    set_state (invert_ (LITTLE_ENDIAN.uint32 bytes 0))
 
   /**
   Shifts the LFSR $n times.
@@ -582,9 +633,9 @@ class MifareCryptoReader extends MifareCryptoBase_:
     prng.set_state --bytes=nonce_tag
 
     prng.shift 64
-    answer_reader := prng.current_bytes
+    answer_reader := prng.state --as_bytes
     prng.shift 32
-    expected_response_tag_ = prng.current_bytes
+    expected_response_tag_ = prng.state --as_bytes
 
     return nonce_reader + answer_reader
 
@@ -782,7 +833,7 @@ class MifareCryptoWriter extends MifareCryptoBase_:
   generate_nonce --seed/int -> ByteArray:
     prng := Crypto1Prng seed
     prng.shift 16
-    return prng.current_bytes
+    return prng.state --as_bytes
 
   /**
   Starts the authentication process.
@@ -821,7 +872,7 @@ class MifareCryptoWriter extends MifareCryptoBase_:
       throw "INVALID_STATE"
     prng := Crypto1Prng --seed_bytes=nonce_tag_
     prng.shift 64
-    expected_challenge_response_reader := prng.current_bytes
+    expected_challenge_response_reader := prng.state --as_bytes
 
     if check:
       challenge_response := response[4..]
@@ -829,7 +880,7 @@ class MifareCryptoWriter extends MifareCryptoBase_:
         throw "INVALID_CHALLENGE_RESPONSE"
 
     prng.shift 32
-    final_authentication_message := prng.current_bytes
+    final_authentication_message := prng.state --as_bytes
     state_ = STATE_ABOUT_TO_SEND_FINAL_MESSAGE_
     return final_authentication_message
 
@@ -870,7 +921,6 @@ class MifareCryptoWriter extends MifareCryptoBase_:
     later.
   */
   encrypt_nonce_tag_ nonce_tag/ByteArray --nested/bool -> ByteArray:
-    print "nested: $nested"
     if state_ != STATE_WAITING_FOR_NONCE_TAG_ and
         state_ != STATE_WAITING_FOR_NESTED_NONCE_TAG_:
       throw "INVALID_STATE"

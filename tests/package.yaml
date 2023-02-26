@@ -1,0 +1,3 @@
+dependencies:
+  mfrc522:
+    path: ..

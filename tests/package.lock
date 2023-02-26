@@ -1,0 +1,5 @@
+prefixes:
+  mfrc522: ..
+packages:
+  ..:
+    path: ..
