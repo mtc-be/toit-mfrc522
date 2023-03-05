@@ -3,6 +3,7 @@
 // in the LICENSE file.
 
 import binary show LITTLE_ENDIAN BIG_ENDIAN
+import .frame
 
 /**
 Crypto-1 cipher and PRNG.
@@ -528,6 +529,12 @@ class MifareCryptoBase_:
       // Decrement for the cipher byte that is right next to it.
       target_index--
 
+  raw_frame_with_encrypted_parity_ --plaintext/ByteArray --ciphertext/ByteArray -> Frame:
+    frame := Frame ciphertext
+    raw := frame.to_raw
+    fix_up_parity_bits raw.bytes --plain=plaintext --cipher=ciphertext
+    return raw
+
 class MifareCryptoReader extends MifareCryptoBase_:
   /**
   The reader was constructed, but no authentication has been started yet.
@@ -665,8 +672,18 @@ class MifareCryptoReader extends MifareCryptoBase_:
 
   Depending on the internal state, the ciphertext might be decrypted
     differently, and or have a different impact on the crypto1 LFSR.
+
+  If the ciphertext_frame is a raw frame (which is usually the case),
+    then $check_parity can be used to ensure that the parity bits
+    are correct.
   */
-  decrypt ciphertext/ByteArray -> ByteArray:
+  decrypt ciphertext_frame/Frame --check_parity/bool=true -> ByteArray:
+    // TODO(florian): check parity.
+    // We can't use the frame's parity check, as we need to decrypt
+    // the message first.
+    non_raw := ciphertext_frame.to_non_raw --check_parity=false
+    ciphertext := non_raw.bytes
+
     if state_ == STATE_WAITING_FOR_NONCE_TAG_ or
         state_ == STATE_WAITING_FOR_NESTED_NONCE_TAG_:
       is_nested := state_ == STATE_WAITING_FOR_NESTED_NONCE_TAG_
@@ -685,31 +702,38 @@ class MifareCryptoReader extends MifareCryptoBase_:
 
     throw "Invalid state"
 
-  encrypt plaintext/ByteArray -> ByteArray:
+  /**
+  Encrypts the given plaintext that is to be sent to the tag.
+
+  Depending on the internal state, the plaintext might be encrypted
+    differently (or not encrypted at all), and or have a different impact
+    on the crypto1 LFSR.
+
+  Always returns a raw frame with the parity bits included.
+  */
+  encrypt plaintext/ByteArray -> Frame:
     if state_ == STATE_AUTHENTICATION_STARTED_:
       // Send out the request without any encryption.
       state_ = STATE_WAITING_FOR_NONCE_TAG_
-      return plaintext
+      return (Frame plaintext).to_raw
 
     if state_ == STATE_NESTED_AUTHENTICATION_STARTED_:
       // Use the existing crypto1 to encrypt the request.
-      encrypted := crypt_ plaintext
+      ciphertext := crypt_ plaintext
       state_ = STATE_WAITING_FOR_NESTED_NONCE_TAG_
-      return encrypted
+      return raw_frame_with_encrypted_parity_ --plaintext=plaintext --ciphertext=ciphertext
 
     if state_ == STATE_UID_AND_NONCE_FED_:
       // The challenge response was created, and is now sent to the tag.
-      return encrypt_challenge_response_ plaintext
+      ciphertext := encrypt_challenge_response_ plaintext
+      return raw_frame_with_encrypted_parity_ --plaintext=plaintext --ciphertext=ciphertext
 
     if state_ == STATE_TAG_RESPONSE_CHECKED_:
       // The tag response was checked, and the reader is now sending
       // the encrypted nonce.
-      return crypt_ plaintext
+      ciphertext := crypt_ plaintext
+      return raw_frame_with_encrypted_parity_ --plaintext=plaintext --ciphertext=ciphertext
 
-    // TODO(florian): we need to be sure we don't
-    // throw for stupid reasons.
-    // Currently just return null.
-    return plaintext
     throw "Invalid state $state_."
 
   /**
@@ -884,21 +908,47 @@ class MifareCryptoWriter extends MifareCryptoBase_:
     state_ = STATE_ABOUT_TO_SEND_FINAL_MESSAGE_
     return final_authentication_message
 
-  encrypt plaintext/ByteArray -> ByteArray:
+  /**
+  Encrypts the given $plaintext.
+
+  The returned frame may or may not be raw.
+  */
+  encrypt plaintext/ByteArray -> Frame:
     if state_ == STATE_WAITING_FOR_NONCE_TAG_ or state_ == STATE_WAITING_FOR_NESTED_NONCE_TAG_:
       is_nested := state_ == STATE_WAITING_FOR_NESTED_NONCE_TAG_
-      return encrypt_nonce_tag_ plaintext --nested=is_nested
+      ciphertext := encrypt_nonce_tag_ plaintext --nested=is_nested
+      if is_nested:
+        return raw_frame_with_encrypted_parity_ --plaintext=plaintext --ciphertext=ciphertext
+      return Frame ciphertext
+
+
     if state_ == STATE_ABOUT_TO_SEND_FINAL_MESSAGE_:
       state_ = STATE_AUTHENTICATED_
       // Fall through to encrypting the final message.
-    return crypt_ plaintext
+    ciphertext := crypt_ plaintext
+    return raw_frame_with_encrypted_parity_ --plaintext=plaintext --ciphertext=ciphertext
 
-  decrypt ciphertext/ByteArray -> ByteArray:
+  /**
+  Decryts the given $ciphertext_frame.
+
+  The returned frame is never raw.
+  */
+  decrypt ciphertext_frame/Frame --check_parity/bool=true -> ByteArray:
+    if state_ == STATE_CONSTRUCTED_:
+      if ciphertext_frame.is_raw:
+        return (ciphertext_frame.to_non_raw --check_parity).bytes
+      return ciphertext_frame.bytes
+
+    if not ciphertext_frame.is_raw: throw "Invalid state or frame"
+
+    // TODO(florian): check parity.
+    // We can't use the frame's parity check, as we need to decrypt
+    // the message first.
+    non_raw := ciphertext_frame.to_non_raw --check_parity=false
+    ciphertext := non_raw.bytes
+    plaintext := ?
     if state_ == STATE_WAITING_FOR_CHALLENGE_RESPONSE_:
       return decrypt_reader_response_ ciphertext
-    else if state_ == STATE_CONSTRUCTED_:
-      // Probably the request to start encryption.
-      return ciphertext
     return crypt_ ciphertext
 
   /**
@@ -1001,13 +1051,8 @@ main:
     reader_response_plain := crypto_reader.generate_challenge_response --nonce_tag=n_t --nonce_reader=n_r
     encrypted_reader_response := crypto_reader.encrypt reader_response_plain
 
-    reader_response_with_parity := crypto_reader.add_parity
-        --plain=reader_response_plain
-        --cipher=encrypted_reader_response
-
     print "reader response: $reader_response_plain"
     print "reader response cipher: $encrypted_reader_response"
-    print "encrypted reader response with parity: $reader_response_with_parity"
 
     // The tag receives the response.
     decrypted_reader_response := crypto_writer.decrypt encrypted_reader_response

@@ -8,75 +8,8 @@ A driver for the MFRC522 RFID reader.
 
 import serial
 import .crypto1
-
-class RfidException:
-  /**
-  Error when a device did not respond.
-
-  This can happen if the user requested to wake a specific device, or if
-    the anti-collision protocol selected one of two cards, but none responded at
-    the next step.
-  */
-  static NO_RESPONSE ::= 0
-
-  /** A CRC error was detected. */
-  static CRC ::= 1
-
-  /** A parity error was detected. */
-  static PARITY ::= 2
-
-  /** A checksum error (BCC, block check character) was detected. */
-  static CHECKSUM ::= 3
-
-  /**
-  A protocol error was detected.
-
-  A card responded in an unexpected way. Most often, this is actually caused by
-    a communication error; for example, when too many cards are in the field.
-  */
-  static PROTOCOL ::= 4
-
-  /** A timeout was detected. */
-  static TIMEOUT_ERROR ::= 5
-
-  /** A collision was detected. */
-  static COLLISION ::= 6
-
-  /**
-  An internal error was detected.
-
-  If encountered, please file a bug; ideally with a reproducible example.
-  */
-  static INTERNAL ::= 7
-
-  /**
-  The internal temperature sensor detected overheating and shut down the antenna drivers.
-  */
-  static TEMPERATURE ::= 8
-
-  code/int
-
-  constructor.no_response: code = NO_RESPONSE
-  constructor.crc:         code = CRC
-  constructor.parity:      code = PARITY
-  constructor.checksum:    code = CHECKSUM
-  constructor.protocol:    code = PROTOCOL
-  constructor.timeout:     code = TIMEOUT_ERROR
-  constructor.collision:   code = COLLISION
-  constructor.internal:    code = INTERNAL
-  constructor.temperature: code = TEMPERATURE
-
-  stringify -> string:
-    if code == NO_RESPONSE: return "No response from card"
-    if code == CRC: return "CRC error"
-    if code == PARITY: return "Parity error"
-    if code == CHECKSUM: return "Checksum error (block check character)"
-    if code == PROTOCOL: return "Protocol error"
-    if code == TIMEOUT_ERROR: return "Timeout"
-    if code == COLLISION: return "Collision"
-    if code == INTERNAL: return "Internal error"
-    if code == TEMPERATURE: return "Temperature error; antenna is off due to overheating"
-    unreachable
+import .frame
+import .nfc_exception
 
 class Mfrc522:
   static COMMAND_REGISTER_ ::= 0x01 << 1
@@ -172,7 +105,7 @@ class Mfrc522:
 
   See section Iso 14443-3 2008; section 6.2.3.1.
   */
-  transceive_short_ command/int --allow_collision/bool -> ReceivedFrame?:
+  transceive_short_ command/int --allow_collision/bool -> Frame?:
     if command >= 0x80: throw "INVALID_ARGUMENT"
 
     frame := Frame #[command] --size_in_bits=7
@@ -190,28 +123,19 @@ class Mfrc522:
 
   If $crypto_ is not null then uses it to encrypt the data.
   */
-  transceive_standard_ bytes/ByteArray --check_crc/bool=false --add_crc/bool=true -> ReceivedFrame?:
-    // For some reason we seem to get a CRC error, while already sending a new frame.
+  transceive_standard_ bytes/ByteArray --check_crc/bool=false --add_crc/bool=true -> Frame?:
     if add_crc:
       crc := compute_crc_ bytes
       bytes += #[crc & 0xFF, (crc >> 8) & 0xFF]
 
-    result_frame/ReceivedFrame? := ?
+    result_frame/Frame? := ?
     if crypto_:
-      ciphertext := crypto_.encrypt bytes
-      with_parity := insert_parity_bits ciphertext
-      crypto_.fix_up_parity_bits with_parity --plain=bytes --cipher=ciphertext
-      frame := Frame with_parity --size_in_bits=(bit_size_of_bytes_with_parity with_parity)
-      disable_parity_
-      result_frame_with_parity := transceive_ frame
-      if not result_frame_with_parity:
-        result_frame = null
-      else:
-        result_bytes_without_parity := remove_parity_bits result_frame_with_parity.bytes --no-check
-        decrypted := crypto_.decrypt result_bytes_without_parity
-        result_frame = ReceivedFrame decrypted
+      frame := crypto_.encrypt bytes
+      result_frame = transceive_ frame
+      if result_frame:
+        decrypted := crypto_.decrypt result_frame
+        result_frame = Frame decrypted
     else:
-      enable_parity_
       frame := Frame bytes
       result_frame = transceive_ frame
 
@@ -222,7 +146,7 @@ class Mfrc522:
     assert: not result_frame.collision_position
     assert: result_frame.bytes.size * 8 == result_frame.size_in_bits
     check_crc_ result_frame.bytes
-    return ReceivedFrame result_frame.bytes[..result_frame.bytes.size - 2]
+    return Frame result_frame.bytes[..result_frame.bytes.size - 2]
 
   /**
   Transmits an anticollision frame and returns the response.
@@ -236,13 +160,12 @@ class Mfrc522:
 
   The response is automatically shifted, so that it would complete the last byte.
   */
-  transceive_anticollision_ bytes/ByteArray --last_byte_bits/int -> ReceivedFrame?:
+  transceive_anticollision_ bytes/ByteArray --last_byte_bits/int -> Frame?:
     frame := Frame bytes --size_in_bits=((bytes.size - 1) * 8 + last_byte_bits)
 
     // When receiving, the first bit should be shifted by 'rx_align', so that the
     // original bytes and the new bits align.
     shift := (last_byte_bits % 8)
-    enable_parity_
     return transceive_ frame --allow_collision --shift_response_by=shift
 
   /**
@@ -315,10 +238,16 @@ class Mfrc522:
     the reader expects a parity bit after 8 - $shift_response_by bits. It ignores this
     bit.
   */
-  transceive_ frame/Frame -> ReceivedFrame?
+  transceive_ frame/Frame -> Frame?
       --command/int=COMMAND_TRANSCEIVE_  // Can also be $COMMAND_MFAUTHENT_.
       --allow_collision/bool=false
       --shift_response_by/int=0:
+
+    if frame.is_raw:
+      disable_parity_
+    else:
+      enable_parity_
+
     // The FIFO can handle up to 64 bytes.
     if frame.bytes.size > 64: throw "INVALID_ARGUMENT"
 
@@ -373,7 +302,7 @@ class Mfrc522:
       // Timeout. Remember that we automatically start the timeout due to the initialization
       // in the $on function.
       if (irqs & 0x01) != 0:
-        throw RfidException.timeout
+        throw NfcException.timeout
       sleep --ms=3
 
     if not completed: return null
@@ -395,7 +324,7 @@ class Mfrc522:
 
     detected_collision := error & 0x08 != 0
     if detected_collision and not allow_collision:
-      throw RfidException.collision
+      throw NfcException.collision
 
     collision_position/int? := ?
     if not detected_collision:
@@ -414,7 +343,7 @@ class Mfrc522:
       has_valid_collision_position := (collision_value & 0x20) == 0
       if not has_valid_collision_position:
         // Collision detected, but without any valid position.
-        throw RfidException.internal
+        throw NfcException.internal
 
       collision_position = collision_value & 0x1F
       // If the collision position is 0, then the collision happened at bit 32.
@@ -422,20 +351,21 @@ class Mfrc522:
       if collision_position == 0: collision_position = 32
 
     // For bit 7 and 4 something is writing even though it shouldn't.
-    if error & 0x80 != 0 or error & 0x10 != 0: throw RfidException.internal
-    if error & 0x40 != 0:                      throw RfidException.temperature
-    if error & 0x04 != 0:                      throw RfidException.crc
-    if error & 0x02 != 0:                      throw RfidException.parity
-    if error & 0x01 != 0:                      throw RfidException.protocol
+    if error & 0x80 != 0 or error & 0x10 != 0: throw NfcException.internal
+    if error & 0x40 != 0:                      throw NfcException.temperature
+    if error & 0x04 != 0:                      throw NfcException.crc
+    if error & 0x02 != 0:                      throw NfcException.parity
+    if error & 0x01 != 0:                      throw NfcException.protocol
 
     response_size := registers_.read_u8 FIFO_LEVEL_REGISTER_
     // We must not use `read_bytes` for SPI. That doesn't yield the correct result.
     result_bytes := ByteArray response_size: registers_.read_u8 FIFO_DATA_REGISTER_
 
     // TODO(florian): read the last-byte bits.
-    result_frame :=  ReceivedFrame result_bytes
+    result_frame := Frame result_bytes
         --collision_position=collision_position
         --size_in_bits=(response_size * 8)
+        --raw=frame.is_raw
 
     return result_frame
 
@@ -460,10 +390,10 @@ class Mfrc522:
     return crc
 
   check_crc_ data/ByteArray:
-    if data.size < 3: throw RfidException.protocol
+    if data.size < 3: throw NfcException.protocol
     crc := compute_crc_ data[..data.size - 2]
     if crc & 0xFF != data[data.size - 2] or crc >> 8 != data[data.size - 1]:
-      throw RfidException.crc
+      throw NfcException.crc
 
   /**
   Executes an anticollision to get the UID of a PICC in the field.
@@ -517,13 +447,13 @@ class Mfrc522:
 
         // Request the PICCs to complete the ID and watch for collisions.
         response_frame := transceive_anticollision_ bytes[..index] --last_byte_bits=last_byte_bits
-        if not response_frame: throw RfidException.no_response
+        if not response_frame: throw NfcException.no_response
 
         response := response_frame.bytes
 
         // The PICC is supposed to complete the UID and add a checksum (BCC).
         if response.size + valid_uid_bytes != 5:
-          throw RfidException.protocol
+          throw NfcException.protocol
 
         // We start by assuming that the response is without collision. If there was one, we will
         // fix that later.
@@ -541,7 +471,7 @@ class Mfrc522:
         detected_collision := response_frame.collision_position != null
         if not detected_collision:
           bcc := uid_buffer[0] ^ uid_buffer[1] ^ uid_buffer[2] ^ uid_buffer[3]
-          if bcc != response[response_index]: throw RfidException.checksum
+          if bcc != response[response_index]: throw NfcException.checksum
           return
 
         collision_position := response_frame.collision_position
@@ -583,11 +513,11 @@ class Mfrc522:
     bytes[6] = bcc
     response_frame := transceive_standard_ bytes --check_crc
 
-    if not response_frame: throw RfidException.no_response
+    if not response_frame: throw NfcException.no_response
 
     response := response_frame.bytes
     // The SAK must be exactly 1 bytes long (once the CRC has been removed).
-    if response.size != 1: throw RfidException.protocol
+    if response.size != 1: throw NfcException.protocol
     return response
 
   /**
@@ -655,7 +585,7 @@ class Mfrc522:
       needs_another_cascade := sak[0] & 0x04 != 0
 
       if needs_another_cascade:
-        if cascade_level == 3: throw RfidException.protocol
+        if cascade_level == 3: throw NfcException.protocol
         continue
 
       // Remove the cascade tags.
@@ -707,67 +637,6 @@ class Mfrc522:
     old := registers_.read_u8 STATUS_2_REGISTER_
     registers_.write_u8 STATUS_2_REGISTER_ (old & ~0x08)
 */
-  /**
-  Inserts odd parity bits into the given $bytes.
-
-  The result is a byte array that has an additional parity bit for each byte.
-  The valid bits of the result can be computed with $bit_size_of_bytes_with_parity.
-  */
-  insert_parity_bits bytes/ByteArray -> ByteArray:
-    if bytes.size == 0: throw "INVALID_ARGUMENT"
-
-    // Add one parity bit per byte.
-    result := ByteArray (bytes.size + (bytes.size + 7) / 8)
-    target_index := 0
-    target_bit_index := 0
-    for i := 0; i < bytes.size; i++:
-      byte := bytes[i]
-      parity := byte.parity ^ 1  // Odd parity.
-      result[target_index] |= byte << target_bit_index
-      target_index++
-      if target_bit_index != 0:
-        result[target_index] |= byte >> (8 - target_bit_index)
-      result[target_index] |= parity << target_bit_index
-      target_bit_index++
-      if target_bit_index == 8:
-        target_bit_index = 0
-        target_index++
-    return result
-
-  bit_size_of_bytes_with_parity bytes/ByteArray -> int:
-    return (bytes.size * 8 / 9) * 9
-
-  /**
-  Removes the parity bits from the given $bytes.
-
-  The result is a byte array that has one less bit for each byte.
-
-  If $check is true then the parity bits are checked and an exception is thrown if they are not
-    correct.
-  */
-  remove_parity_bits bytes/ByteArray --check/bool=true -> ByteArray:
-    result := ByteArray (bytes.size * 8 / 9)
-    source_index := 0
-    source_bit_index := 0
-
-    for i := 0; i < result.size; i++:
-      byte := bytes[source_index] >> source_bit_index
-      source_index++
-      if source_bit_index != 0:
-        byte |= bytes[source_index] << (8 - source_bit_index)
-        byte &= 0xFF
-      parity_bit := (bytes[source_index] >> source_bit_index) & 1
-      source_bit_index++
-      if source_bit_index == 8:
-        source_index++
-        source_bit_index = 0
-
-      if check:
-        parity := byte.parity ^ 1  // Odd parity.
-        if parity != parity_bit: throw RfidException.parity
-
-      result[i] = byte
-    return result
 
   is_authenticated_ -> bool:
     return crypto_ != null
@@ -835,7 +704,7 @@ class Mfrc522:
   stop_crypto_:
     crypto_ = null
 
-  wake_up_cards_ --only_new/bool=false -> ReceivedFrame?:
+  wake_up_cards_ --only_new/bool=false -> Frame?:
     reset_communication_
 
     // Wake up the given PICC.
@@ -974,39 +843,6 @@ class Mfrc522:
       if version == self_test_data.version and bytes == self_test_data.bytes: return
 
     throw "Self test failed; unknown self-test data: $version $bytes"
-
-/**
-An RFID frame.
-
-Depending on the configuration the frame could be raw (where parity bits must be
-  handled by the caller) or not.
-*/
-class Frame:
-  bytes/ByteArray
-  size_in_bits/int
-
-  /**
-  Constructs a new frame with the given $bytes.
-
-  The $size_in_bits is the number of bits in the frame. It does not need to be a multiple of 8.
-
-  The number of bytes must be at least ($size_in_bits + 7) / 8. In other words, there must be
-    enough bits in the given $bytes array.
-  */
-  constructor .bytes --.size_in_bits=(bytes.size * 8):
-
-  stringify -> string:
-    return "Frame($size_in_bits bits: $bytes)"
-
-/**
-An RFID frame that was received.
-*/
-class ReceivedFrame extends Frame:
-  /** The position of a collision if there was one. */
-  collision_position/int?
-
-  constructor bytes/ByteArray --size_in_bits/int=(bytes.size * 8) --.collision_position=null:
-    super bytes --size_in_bits=size_in_bits
 
 /**
 Firmware data for self-tests.

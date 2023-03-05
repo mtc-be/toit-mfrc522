@@ -142,13 +142,13 @@ test_mifare_classic_authentication:
   reader.start_authentication --key=key
   encrypted_auth_request := reader.encrypt #[0x60, 0x3c]
   // This is not a nested authentication. So the request isn't encrypted.
-  expect_equals #[0x60, 0x3c] encrypted_auth_request
+  expect_equals #[0x60, 0x3c] (encrypted_auth_request.to_non_raw --no-check_parity).bytes
 
   writer.start_authentication --key=key
   nonce_tag := #[0x0e, 0x61, 0x64, 0xd6]
   encrypted_nonce_response := writer.encrypt nonce_tag
   // This isn't a nested authentication, so the nonce isn't encrypted.
-  expect_equals nonce_tag encrypted_nonce_response
+  expect_equals nonce_tag (encrypted_nonce_response.to_non_raw --no-check_parity).bytes
   decrypted_nonce_response := reader.decrypt encrypted_nonce_response
   expect_equals nonce_tag decrypted_nonce_response
 
@@ -161,14 +161,16 @@ test_mifare_classic_authentication:
   encrypted_challenge_response := reader.encrypt challenge_response
   expect_equals
       #[0x78, 0x5a, 0x41, 0x80, 0x50, 0x04, 0x8f, 0x22]
-      encrypted_challenge_response
+      (encrypted_challenge_response.to_non_raw --no-check_parity).bytes
   decrypted_challenge_response := writer.decrypt encrypted_challenge_response
   expect_equals challenge_response decrypted_challenge_response
 
   final_message := writer.compute_final_message decrypted_challenge_response
   expect_equals #[0x41, 0x3e, 0xeb, 0xcf] final_message
   encrypted_final_message := writer.encrypt final_message
-  expect_equals #[0xce, 0xca, 0x0d, 0x83] encrypted_final_message
+  expect_equals
+      #[0xce, 0xca, 0x0d, 0x83]
+      (encrypted_final_message.to_non_raw --no-check_parity).bytes
   decrypted_final_message := reader.decrypt encrypted_final_message
   expect_equals final_message decrypted_final_message
 
@@ -177,7 +179,9 @@ test_mifare_classic_authentication:
 
   // Communication can proceed normally now.
   encrypted_command := reader.encrypt #[0x30, 0x3f, 0x76, 0x61]
-  expect_equals #[0x69, 0xac, 0x4f, 0x02] encrypted_command
+  expect_equals
+      #[0x69, 0xac, 0x4f, 0x02]
+      (encrypted_command.to_non_raw --no-check_parity).bytes
   decrypted_command := writer.decrypt encrypted_command
   expect_equals #[0x30, 0x3f, 0x76, 0x61] decrypted_command
 
@@ -196,7 +200,9 @@ test_mifare_classic_authentication:
   nonce_tag = #[0xdc, 0xfc, 0x96, 0x2b]
   encrypted_nonce_response = writer.encrypt nonce_tag
   // Since this is a nested authentication, the nonce is already encrypted.
-  expect_equals #[0x23, 0x23, 0x6e, 0xf4] encrypted_nonce_response
+  expect_equals
+      #[0x23, 0x23, 0x6e, 0xf4]
+      (encrypted_nonce_response.to_non_raw --no-check_parity).bytes
   decrypted_nonce_response = reader.decrypt encrypted_nonce_response
   expect_equals nonce_tag decrypted_nonce_response
 
@@ -209,14 +215,16 @@ test_mifare_classic_authentication:
   encrypted_challenge_response = reader.encrypt challenge_response
   expect_equals
       #[0x1a, 0xb9, 0xef, 0x7b, 0xc5, 0xc3, 0x51, 0x57]
-      encrypted_challenge_response
+      (encrypted_challenge_response.to_non_raw --no-check_parity).bytes
   decrypted_challenge_response = writer.decrypt encrypted_challenge_response
   expect_equals challenge_response decrypted_challenge_response
 
   final_message = writer.compute_final_message decrypted_challenge_response
   expect_equals #[0x6e, 0x27, 0x63, 0x93] final_message
   encrypted_final_message = writer.encrypt final_message
-  expect_equals #[0x3e, 0x19, 0x48, 0xf4] encrypted_final_message
+  expect_equals
+      #[0x3e, 0x19, 0x48, 0xf4]
+      (encrypted_final_message.to_non_raw --no-check_parity).bytes
   decrypted_final_message = reader.decrypt encrypted_final_message
   expect_equals final_message decrypted_final_message
 
@@ -225,7 +233,9 @@ test_mifare_classic_authentication:
 
   // Communication can proceed normally now.
   encrypted_command = reader.encrypt #[0x30, 0x37, 0x3e, 0xed]
-  expect_equals #[0xd6, 0x59, 0xb4, 0x73] encrypted_command
+  expect_equals
+      #[0xd6, 0x59, 0xb4, 0x73]
+      (encrypted_command.to_non_raw --no-check_parity).bytes
   decrypted_command = writer.decrypt encrypted_command
   expect_equals #[0x30, 0x37, 0x3e, 0xed] decrypted_command
 
